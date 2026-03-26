@@ -37,13 +37,14 @@
           cargoArtifacts = craneLib.buildDepsOnly args;
         }
       );
+      version = "0.4.0";
 
       rift-bin = pkgs.stdenv.mkDerivation {
         pname = "rift-bin";
-        version = "0.2.8";
+        version = version;
         src = builtins.fetchTarball {
-          url = "https://github.com/acsandmann/rift/releases/download/v0.2.8/rift-universal-macos-0.2.8.tar.gz";
-          sha256 = "1cm3nqz6bl01i337yg1l9v616w4kkcsc1m725s9hgj5zgprhybna";
+          url = "https://github.com/acsandmann/rift/releases/download/v${version}/rift-universal-macos-${version}.tar.gz";
+          sha256 = "063wmi5xyid0pp5s6pdvigvqqj5di4mnq0x44m3rbh5sy90km6lb";
         };
         phases = [ "installPhase" ];
         installPhase = ''
