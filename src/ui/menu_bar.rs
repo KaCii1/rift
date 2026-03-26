@@ -1,11 +1,13 @@
 // many ideas for how this works were taken from https://github.com/xiamaz/YabaiIndicator
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{DefinedClass, MainThreadOnly, Message, define_class, msg_send};
+use objc2::{ClassType, DefinedClass, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSColor, NSFont, NSFontAttributeName, NSForegroundColorAttributeName, NSGraphicsContext,
+    NSColor, NSControlStateValueOff, NSControlStateValueOn, NSEventModifierFlags, NSFont,
+    NSFontAttributeName, NSForegroundColorAttributeName, NSGraphicsContext, NSMenu, NSMenuItem,
     NSStatusBar, NSStatusItem, NSVariableStatusItemLength, NSView,
 };
 use objc2_core_foundation::{
@@ -14,17 +16,24 @@ use objc2_core_foundation::{
 use objc2_core_graphics::{CGBlendMode, CGContext};
 use objc2_core_text::CTLine;
 use objc2_foundation::{
-    MainThreadMarker, NSAttributedStringKey, NSDictionary, NSMutableDictionary, NSRect, NSSize,
-    NSString,
+    MainThreadMarker, NSAttributedStringKey, NSDictionary, NSMutableDictionary, NSObject, NSRect,
+    NSSize, NSString,
 };
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
 
+use crate::actor::reactor::{Command as ReactorTopCommand, ReactorCommand};
+use crate::actor::wm_controller::{WmCmd, WmCommand};
 use crate::common::config::{
-    ActiveWorkspaceLabel, MenuBarDisplayMode, MenuBarSettings, WorkspaceDisplayStyle,
+    ActiveWorkspaceLabel, LayoutMode, MenuBarDisplayMode, MenuBarSettings, WorkspaceDisplayStyle,
+    WorkspaceSelector,
 };
+use crate::layout_engine::LayoutCommand;
 use crate::model::VirtualWorkspaceId;
 use crate::model::server::{WindowData, WorkspaceData};
+use crate::sys::hotkey::{Hotkey, KeyCode, Modifiers};
 use crate::sys::screen::SpaceId;
+use crate::ui::common::compute_window_layout_metrics;
 
 const CELL_WIDTH: f64 = 20.0;
 const CELL_HEIGHT: f64 = 15.0;
@@ -34,18 +43,46 @@ const BORDER_WIDTH: f64 = 1.0;
 const CONTENT_INSET: f64 = 2.0;
 const FONT_SIZE: f64 = 12.0;
 
+#[derive(Debug, Clone, Copy)]
+pub enum MenuAction {
+    SetLayout(LayoutMode),
+    ToggleSpaceActivated,
+    NextWorkspace,
+    PrevWorkspace,
+    SwitchToWorkspace(usize),
+    OpenGitHub,
+    OpenDocumentation,
+    OpenMatrix,
+    OpenConfig,
+    ReloadConfig,
+    QuitRift,
+}
+
 pub struct MenuIcon {
     status_item: Retained<NSStatusItem>,
     view: Retained<MenuIconView>,
+    menu: Retained<NSMenu>,
+    menu_handler: Retained<MenuActionHandler>,
     mtm: MainThreadMarker,
     prev_width: f64,
 }
 
 impl MenuIcon {
-    pub fn new(mtm: MainThreadMarker) -> Self {
+    pub fn new(mtm: MainThreadMarker, action_tx: UnboundedSender<MenuAction>) -> Self {
         let status_bar = NSStatusBar::systemStatusBar();
         let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
         let view = MenuIconView::new(mtm);
+        let menu_handler = MenuActionHandler::new(mtm, action_tx);
+        let menu = build_status_menu(
+            mtm,
+            &menu_handler,
+            None,
+            SpaceId::new(0),
+            true,
+            &[],
+            &MenuShortcuts::default(),
+        );
+        status_item.setMenu(Some(&menu));
         if let Some(btn) = status_item.button(mtm) {
             btn.addSubview(&*view);
             view.setFrameSize(NSSize::new(0.0, 0.0));
@@ -55,6 +92,8 @@ impl MenuIcon {
         Self {
             status_item,
             view,
+            menu,
+            menu_handler,
             mtm,
             prev_width: 0.0,
         }
@@ -62,12 +101,31 @@ impl MenuIcon {
 
     pub fn update(
         &mut self,
-        _active_space: SpaceId,
-        workspaces: Vec<WorkspaceData>,
+        active_space: SpaceId,
+        active_space_is_activated: bool,
+        workspaces: &[WorkspaceData],
         _active_workspace: Option<VirtualWorkspaceId>,
-        _windows: Vec<WindowData>,
+        _windows: &[WindowData],
         settings: &MenuBarSettings,
+        hotkeys: &[(Hotkey, WmCommand)],
     ) {
+        let active_layout = workspaces
+            .iter()
+            .find(|w| w.is_active)
+            .and_then(|w| parse_layout_mode(&w.layout_mode));
+        let shortcuts = MenuShortcuts::from_hotkeys(hotkeys);
+        let menu = build_status_menu(
+            self.mtm,
+            &self.menu_handler,
+            active_layout,
+            active_space,
+            active_space_is_activated,
+            workspaces,
+            &shortcuts,
+        );
+        self.status_item.setMenu(Some(&menu));
+        self.menu = menu;
+
         let mode = settings.mode;
         let style = settings.display_style;
         let label_for = |workspace: &WorkspaceData| match settings.active_label {
@@ -84,10 +142,11 @@ impl MenuIcon {
         let render_inputs = match (mode, style) {
             (MenuBarDisplayMode::All, WorkspaceDisplayStyle::Layout) => {
                 let filtered = if settings.show_empty {
-                    workspaces
+                    workspaces.to_vec()
                 } else {
                     workspaces
-                        .into_iter()
+                        .iter()
+                        .cloned()
                         .filter(|w| w.window_count > 0 || w.is_active)
                         .collect::<Vec<_>>()
                 };
@@ -101,7 +160,8 @@ impl MenuIcon {
                     .collect()
             }
             (MenuBarDisplayMode::All, WorkspaceDisplayStyle::Label) => workspaces
-                .into_iter()
+                .iter()
+                .cloned()
                 .filter(|w| settings.show_empty || w.window_count > 0 || w.is_active)
                 .map(|ws| {
                     let mut clone = ws.clone();
@@ -115,7 +175,8 @@ impl MenuIcon {
                 })
                 .collect(),
             (MenuBarDisplayMode::Active, WorkspaceDisplayStyle::Layout) => workspaces
-                .into_iter()
+                .iter()
+                .cloned()
                 .find(|w| w.is_active)
                 .map(|ws| {
                     vec![WorkspaceRenderInput {
@@ -126,7 +187,8 @@ impl MenuIcon {
                 })
                 .unwrap_or_default(),
             (MenuBarDisplayMode::Active, WorkspaceDisplayStyle::Label) => workspaces
-                .into_iter()
+                .iter()
+                .cloned()
                 .find(|w| w.is_active)
                 .map(|ws| {
                     let mut clone = ws.clone();
@@ -201,7 +263,7 @@ struct MenuIconLayout {
 struct WorkspaceRenderData {
     bg_rect: CGRect,
     fill_alpha: f64,
-    windows: Vec<WindowRenderRect>,
+    windows: Vec<CGRect>,
     label_line: Option<CachedTextLine>,
     show_windows: bool,
 }
@@ -210,13 +272,6 @@ struct WorkspaceRenderInput {
     workspace: WorkspaceData,
     label: String,
     show_windows: bool,
-}
-
-struct WindowRenderRect {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
 }
 
 struct CachedTextLine {
@@ -235,6 +290,485 @@ struct MenuIconViewIvars {
 fn as_any_object<T: Message>(obj: &T) -> &AnyObject {
     unsafe { &*(obj as *const T as *const AnyObject) }
 }
+
+fn parse_layout_mode(layout_mode: &str) -> Option<LayoutMode> {
+    match layout_mode {
+        "traditional" => Some(LayoutMode::Traditional),
+        "bsp" => Some(LayoutMode::Bsp),
+        "stack" => Some(LayoutMode::Stack),
+        "master_stack" => Some(LayoutMode::MasterStack),
+        "scrolling" => Some(LayoutMode::Scrolling),
+        _ => None,
+    }
+}
+
+fn layout_title(mode: LayoutMode) -> &'static str {
+    match mode {
+        LayoutMode::Traditional => "Traditional",
+        LayoutMode::Bsp => "BSP",
+        LayoutMode::Stack => "Stack",
+        LayoutMode::MasterStack => "Master Stack",
+        LayoutMode::Scrolling => "Scrolling",
+    }
+}
+
+fn make_menu_item(
+    mtm: MainThreadMarker,
+    title: &str,
+    action: Option<objc2::runtime::Sel>,
+    target: Option<&MenuActionHandler>,
+    checked: Option<bool>,
+    key_equivalent: Option<&Hotkey>,
+    tag: Option<isize>,
+) -> Retained<NSMenuItem> {
+    let ns_title = NSString::from_str(title);
+    let key_equivalent_empty = NSString::from_str("");
+    let item: Retained<NSMenuItem> = unsafe {
+        msg_send![NSMenuItem::alloc(mtm), initWithTitle: &*ns_title, action: action, keyEquivalent: &*key_equivalent_empty]
+    };
+    if let Some(target) = target {
+        unsafe {
+            item.setTarget(Some(target));
+        }
+    }
+    if let Some(checked) = checked {
+        item.setState(if checked {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
+    }
+
+    if let Some((key, modifiers)) = key_equivalent.and_then(menu_hotkey_to_key_equivalent) {
+        let key = NSString::from_str(key);
+        item.setKeyEquivalent(&key);
+        item.setKeyEquivalentModifierMask(modifiers);
+    }
+    if let Some(tag) = tag {
+        item.setTag(tag);
+    }
+
+    item
+}
+
+fn add_separator(menu: &NSMenu) {
+    let separator: Retained<NSMenuItem> = unsafe { msg_send![NSMenuItem::class(), separatorItem] };
+    menu.addItem(&separator);
+}
+
+fn build_status_menu(
+    mtm: MainThreadMarker,
+    handler: &MenuActionHandler,
+    active_layout: Option<LayoutMode>,
+    _active_space: SpaceId,
+    active_space_is_activated: bool,
+    workspaces: &[WorkspaceData],
+    shortcuts: &MenuShortcuts,
+) -> Retained<NSMenu> {
+    let title = NSString::from_str("Rift");
+    let menu: Retained<NSMenu> = unsafe { msg_send![NSMenu::alloc(mtm), initWithTitle: &*title] };
+
+    let layout_item = make_menu_item(mtm, "Layout", None, None, None, None, None);
+    let layout_submenu_title = NSString::from_str("Layout");
+    let layout_submenu: Retained<NSMenu> =
+        unsafe { msg_send![NSMenu::alloc(mtm), initWithTitle: &*layout_submenu_title] };
+
+    for mode in [
+        LayoutMode::Traditional,
+        LayoutMode::Bsp,
+        LayoutMode::Stack,
+        LayoutMode::MasterStack,
+        LayoutMode::Scrolling,
+    ] {
+        let action = match mode {
+            LayoutMode::Traditional => sel!(onSetLayoutTraditional:),
+            LayoutMode::Bsp => sel!(onSetLayoutBsp:),
+            LayoutMode::Stack => sel!(onSetLayoutStack:),
+            LayoutMode::MasterStack => sel!(onSetLayoutMasterStack:),
+            LayoutMode::Scrolling => sel!(onSetLayoutScrolling:),
+        };
+        let item = make_menu_item(
+            mtm,
+            layout_title(mode),
+            Some(action),
+            Some(handler),
+            Some(active_layout == Some(mode)),
+            None,
+            None,
+        );
+        layout_submenu.addItem(&item);
+    }
+    layout_item.setSubmenu(Some(&layout_submenu));
+    menu.addItem(&layout_item);
+
+    let workspace_item = make_menu_item(mtm, "Workspaces", None, None, None, None, None);
+    let ws_submenu_title = NSString::from_str("Workspace");
+    let ws_submenu: Retained<NSMenu> =
+        unsafe { msg_send![NSMenu::alloc(mtm), initWithTitle: &*ws_submenu_title] };
+
+    ws_submenu.addItem(&make_menu_item(
+        mtm,
+        "Next Workspace",
+        Some(sel!(onNextWorkspace:)),
+        Some(handler),
+        None,
+        shortcuts.next_workspace.as_ref(),
+        None,
+    ));
+    ws_submenu.addItem(&make_menu_item(
+        mtm,
+        "Previous Workspace",
+        Some(sel!(onPrevWorkspace:)),
+        Some(handler),
+        None,
+        shortcuts.prev_workspace.as_ref(),
+        None,
+    ));
+    add_separator(&ws_submenu);
+
+    for ws in workspaces {
+        let ws_label = if ws.name.is_empty() {
+            format!("Workspace {}", ws.index + 1)
+        } else {
+            format!("{} ({})", ws.name, ws.index + 1)
+        };
+        let ws_shortcut = shortcuts
+            .switch_workspace_by_index
+            .get(&ws.index)
+            .or_else(|| shortcuts.switch_workspace_by_name.get(&ws.name));
+        let ws_item = make_menu_item(
+            mtm,
+            &ws_label,
+            Some(sel!(onSwitchWorkspace:)),
+            Some(handler),
+            Some(ws.is_active),
+            ws_shortcut,
+            Some(ws.index as isize),
+        );
+        ws_submenu.addItem(&ws_item);
+    }
+    if workspaces.is_empty() {
+        workspace_item.setEnabled(false);
+    } else {
+        workspace_item.setSubmenu(Some(&ws_submenu));
+    }
+    menu.addItem(&workspace_item);
+
+    menu.addItem(&make_menu_item(
+        mtm,
+        "Enable Tiling",
+        Some(sel!(onToggleSpaceActivation:)),
+        Some(handler),
+        Some(active_space_is_activated),
+        shortcuts.toggle_space_activation.as_ref(),
+        None,
+    ));
+
+    add_separator(&menu);
+    menu.addItem(&make_menu_item(
+        mtm,
+        "Settings…",
+        Some(sel!(onOpenConfig:)),
+        Some(handler),
+        None,
+        None,
+        None,
+    ));
+    menu.addItem(&make_menu_item(
+        mtm,
+        "Reload Config",
+        Some(sel!(onReloadConfig:)),
+        Some(handler),
+        None,
+        None,
+        None,
+    ));
+
+    let help_item = make_menu_item(mtm, "Help / Documentation", None, None, None, None, None);
+    let help_submenu_title = NSString::from_str("Help / Documentation");
+    let help_submenu: Retained<NSMenu> =
+        unsafe { msg_send![NSMenu::alloc(mtm), initWithTitle: &*help_submenu_title] };
+    help_submenu.addItem(&make_menu_item(
+        mtm,
+        "Documentation",
+        Some(sel!(onOpenDocumentation:)),
+        Some(handler),
+        None,
+        None,
+        None,
+    ));
+    help_submenu.addItem(&make_menu_item(
+        mtm,
+        "GitHub",
+        Some(sel!(onOpenGitHub:)),
+        Some(handler),
+        None,
+        None,
+        None,
+    ));
+    help_submenu.addItem(&make_menu_item(
+        mtm,
+        "Matrix",
+        Some(sel!(onOpenMatrix:)),
+        Some(handler),
+        None,
+        None,
+        None,
+    ));
+    help_item.setSubmenu(Some(&help_submenu));
+    menu.addItem(&help_item);
+
+    add_separator(&menu);
+    menu.addItem(&make_menu_item(
+        mtm,
+        "Quit Rift",
+        Some(sel!(onQuitRift:)),
+        Some(handler),
+        None,
+        shortcuts.quit_rift.as_ref(),
+        None,
+    ));
+
+    menu
+}
+
+#[derive(Default)]
+struct MenuShortcuts {
+    toggle_space_activation: Option<Hotkey>,
+    next_workspace: Option<Hotkey>,
+    prev_workspace: Option<Hotkey>,
+    quit_rift: Option<Hotkey>,
+    switch_workspace_by_index: HashMap<usize, Hotkey>,
+    switch_workspace_by_name: HashMap<String, Hotkey>,
+}
+
+impl MenuShortcuts {
+    fn from_hotkeys(hotkeys: &[(Hotkey, WmCommand)]) -> Self {
+        let mut out = Self::default();
+
+        for (hotkey, command) in hotkeys {
+            match command {
+                WmCommand::Wm(WmCmd::ToggleSpaceActivated) => {
+                    out.toggle_space_activation.get_or_insert_with(|| hotkey.clone());
+                }
+                WmCommand::Wm(WmCmd::NextWorkspace) => {
+                    out.next_workspace.get_or_insert_with(|| hotkey.clone());
+                }
+                WmCommand::Wm(WmCmd::PrevWorkspace) => {
+                    out.prev_workspace.get_or_insert_with(|| hotkey.clone());
+                }
+                WmCommand::Wm(WmCmd::SwitchToWorkspace(WorkspaceSelector::Index(i))) => {
+                    out.switch_workspace_by_index.entry(*i).or_insert_with(|| hotkey.clone());
+                }
+                WmCommand::Wm(WmCmd::SwitchToWorkspace(WorkspaceSelector::Name(name))) => {
+                    out.switch_workspace_by_name
+                        .entry(name.clone())
+                        .or_insert_with(|| hotkey.clone());
+                }
+                WmCommand::ReactorCommand(ReactorTopCommand::Reactor(
+                    ReactorCommand::ToggleSpaceActivated,
+                )) => {
+                    out.toggle_space_activation.get_or_insert_with(|| hotkey.clone());
+                }
+                WmCommand::ReactorCommand(ReactorTopCommand::Layout(
+                    LayoutCommand::NextWorkspace(_),
+                )) => {
+                    out.next_workspace.get_or_insert_with(|| hotkey.clone());
+                }
+                WmCommand::ReactorCommand(ReactorTopCommand::Layout(
+                    LayoutCommand::PrevWorkspace(_),
+                )) => {
+                    out.prev_workspace.get_or_insert_with(|| hotkey.clone());
+                }
+                WmCommand::ReactorCommand(ReactorTopCommand::Layout(
+                    LayoutCommand::SwitchToWorkspace(i),
+                )) => {
+                    out.switch_workspace_by_index.entry(*i).or_insert_with(|| hotkey.clone());
+                }
+                WmCommand::ReactorCommand(ReactorTopCommand::Reactor(
+                    ReactorCommand::SaveAndExit,
+                )) => {
+                    out.quit_rift.get_or_insert_with(|| hotkey.clone());
+                }
+                _ => {}
+            }
+        }
+
+        out
+    }
+}
+
+fn menu_hotkey_to_key_equivalent(hotkey: &Hotkey) -> Option<(&'static str, NSEventModifierFlags)> {
+    let key = match hotkey.key_code {
+        KeyCode::KeyA => "a",
+        KeyCode::KeyB => "b",
+        KeyCode::KeyC => "c",
+        KeyCode::KeyD => "d",
+        KeyCode::KeyE => "e",
+        KeyCode::KeyF => "f",
+        KeyCode::KeyG => "g",
+        KeyCode::KeyH => "h",
+        KeyCode::KeyI => "i",
+        KeyCode::KeyJ => "j",
+        KeyCode::KeyK => "k",
+        KeyCode::KeyL => "l",
+        KeyCode::KeyM => "m",
+        KeyCode::KeyN => "n",
+        KeyCode::KeyO => "o",
+        KeyCode::KeyP => "p",
+        KeyCode::KeyQ => "q",
+        KeyCode::KeyR => "r",
+        KeyCode::KeyS => "s",
+        KeyCode::KeyT => "t",
+        KeyCode::KeyU => "u",
+        KeyCode::KeyV => "v",
+        KeyCode::KeyW => "w",
+        KeyCode::KeyX => "x",
+        KeyCode::KeyY => "y",
+        KeyCode::KeyZ => "z",
+        KeyCode::Digit0 => "0",
+        KeyCode::Digit1 => "1",
+        KeyCode::Digit2 => "2",
+        KeyCode::Digit3 => "3",
+        KeyCode::Digit4 => "4",
+        KeyCode::Digit5 => "5",
+        KeyCode::Digit6 => "6",
+        KeyCode::Digit7 => "7",
+        KeyCode::Digit8 => "8",
+        KeyCode::Digit9 => "9",
+        KeyCode::Minus => "-",
+        KeyCode::Equal => "=",
+        KeyCode::BracketLeft => "[",
+        KeyCode::BracketRight => "]",
+        KeyCode::Semicolon => ";",
+        KeyCode::Quote => "'",
+        KeyCode::Backquote => "`",
+        KeyCode::Backslash => "\\",
+        KeyCode::Comma => ",",
+        KeyCode::Period => ".",
+        KeyCode::Slash => "/",
+        _ => return None,
+    };
+
+    let mut flags = NSEventModifierFlags::empty();
+    if hotkey.modifiers.intersects(Modifiers::META) {
+        flags.insert(NSEventModifierFlags::Command);
+    }
+    if hotkey.modifiers.intersects(Modifiers::CONTROL) {
+        flags.insert(NSEventModifierFlags::Control);
+    }
+    if hotkey.modifiers.intersects(Modifiers::ALT) {
+        flags.insert(NSEventModifierFlags::Option);
+    }
+    if hotkey.modifiers.intersects(Modifiers::SHIFT) {
+        flags.insert(NSEventModifierFlags::Shift);
+    }
+
+    Some((key, flags))
+}
+
+struct MenuActionHandlerIvars {
+    action_tx: UnboundedSender<MenuAction>,
+}
+
+impl MenuActionHandler {
+    fn new(mtm: MainThreadMarker, action_tx: UnboundedSender<MenuAction>) -> Retained<Self> {
+        let this = mtm.alloc().set_ivars(MenuActionHandlerIvars { action_tx });
+        unsafe { msg_send![super(this), init] }
+    }
+
+    fn emit(&self, action: MenuAction) { let _ = self.ivars().action_tx.send(action); }
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "RiftMenuBarActionHandler"]
+    #[ivars = MenuActionHandlerIvars]
+    struct MenuActionHandler;
+
+    impl MenuActionHandler {
+        #[unsafe(method(onSetLayoutTraditional:))]
+        fn on_set_layout_traditional(&self, _sender: Option<&AnyObject>) {
+            self.emit(MenuAction::SetLayout(LayoutMode::Traditional));
+        }
+
+        #[unsafe(method(onSetLayoutBsp:))]
+        fn on_set_layout_bsp(&self, _sender: Option<&AnyObject>) {
+            self.emit(MenuAction::SetLayout(LayoutMode::Bsp));
+        }
+
+        #[unsafe(method(onSetLayoutStack:))]
+        fn on_set_layout_stack(&self, _sender: Option<&AnyObject>) {
+            self.emit(MenuAction::SetLayout(LayoutMode::Stack));
+        }
+
+        #[unsafe(method(onSetLayoutMasterStack:))]
+        fn on_set_layout_master_stack(&self, _sender: Option<&AnyObject>) {
+            self.emit(MenuAction::SetLayout(LayoutMode::MasterStack));
+        }
+
+        #[unsafe(method(onSetLayoutScrolling:))]
+        fn on_set_layout_scrolling(&self, _sender: Option<&AnyObject>) {
+            self.emit(MenuAction::SetLayout(LayoutMode::Scrolling));
+        }
+
+        #[unsafe(method(onToggleSpaceActivation:))]
+        fn on_toggle_space_activation(&self, _sender: Option<&AnyObject>) {
+            self.emit(MenuAction::ToggleSpaceActivated);
+        }
+
+        #[unsafe(method(onNextWorkspace:))]
+        fn on_next_workspace(&self, _sender: Option<&AnyObject>) {
+            self.emit(MenuAction::NextWorkspace);
+        }
+
+        #[unsafe(method(onPrevWorkspace:))]
+        fn on_prev_workspace(&self, _sender: Option<&AnyObject>) {
+            self.emit(MenuAction::PrevWorkspace);
+        }
+
+        #[unsafe(method(onSwitchWorkspace:))]
+        fn on_switch_workspace(&self, sender: Option<&NSMenuItem>) {
+            if let Some(sender) = sender {
+                let tag = sender.tag();
+                if tag >= 0 {
+                    self.emit(MenuAction::SwitchToWorkspace(tag as usize));
+                }
+            }
+        }
+
+        #[unsafe(method(onOpenConfig:))]
+        fn on_open_config(&self, _sender: Option<&AnyObject>) {
+            self.emit(MenuAction::OpenConfig);
+        }
+
+        #[unsafe(method(onOpenDocumentation:))]
+        fn on_open_documentation(&self, _sender: Option<&AnyObject>) {
+            self.emit(MenuAction::OpenDocumentation);
+        }
+
+        #[unsafe(method(onOpenGitHub:))]
+        fn on_open_github(&self, _sender: Option<&AnyObject>) {
+            self.emit(MenuAction::OpenGitHub);
+        }
+
+        #[unsafe(method(onOpenMatrix:))]
+        fn on_open_matrix(&self, _sender: Option<&AnyObject>) {
+            self.emit(MenuAction::OpenMatrix);
+        }
+
+        #[unsafe(method(onReloadConfig:))]
+        fn on_reload_config(&self, _sender: Option<&AnyObject>) {
+            self.emit(MenuAction::ReloadConfig);
+        }
+
+        #[unsafe(method(onQuitRift:))]
+        fn on_quit_rift(&self, _sender: Option<&AnyObject>) {
+            self.emit(MenuAction::QuitRift);
+        }
+    }
+);
 
 fn build_text_attrs(
     font: &NSFont,
@@ -338,78 +872,25 @@ fn build_layout(
         };
 
         let windows = if input.show_windows && !workspace.windows.is_empty() {
-            let min_x =
-                workspace.windows.iter().map(|w| w.frame.origin.x).fold(f64::INFINITY, f64::min);
-            let min_y =
-                workspace.windows.iter().map(|w| w.frame.origin.y).fold(f64::INFINITY, f64::min);
-            let max_x = workspace
-                .windows
-                .iter()
-                .map(|w| w.frame.origin.x + w.frame.size.width)
-                .fold(f64::NEG_INFINITY, f64::max);
-            let max_y = workspace
-                .windows
-                .iter()
-                .map(|w| w.frame.origin.y + w.frame.size.height)
-                .fold(f64::NEG_INFINITY, f64::max);
-
-            let disp_w = (max_x - min_x).max(1.0);
-            let disp_h = (max_y - min_y).max(1.0);
-
-            let cx = bg_x + CONTENT_INSET;
-            let cy = bg_y + CONTENT_INSET;
-            let cw = (CELL_WIDTH - 2.0 * CONTENT_INSET).max(1.0);
-            let ch = (CELL_HEIGHT - 2.0 * CONTENT_INSET).max(1.0);
-
-            let scaling = if disp_h > disp_w {
-                disp_h / ch
-            } else {
-                disp_w / cw
-            };
-            let sf = 1.0 / scaling;
-
-            let xoffset = if disp_h > disp_w {
-                (cw - disp_w * sf) / 2.0
-            } else {
-                0.0
-            } + cx;
-            let yoffset = if disp_h > disp_w {
-                0.0
-            } else {
-                (ch - disp_h * sf) / 2.0
-            } + cy;
-
-            let mut rects = Vec::with_capacity(workspace.windows.len());
-            for window in workspace.windows.iter().rev() {
-                let wx = window.frame.origin.x - min_x;
-                let wy_top = window.frame.origin.y - min_y + window.frame.size.height;
-                let wy = disp_h - wy_top;
-                let ww = window.frame.size.width;
-                let wh = window.frame.size.height;
-
-                let mut rx = xoffset + wx * sf;
-                let mut ry = yoffset + wy * sf;
-                let mut rw = (ww * sf).max(2.0);
-                let mut rh = (wh * sf).max(2.0);
-
+            let layout = compute_window_layout_metrics(
+                &workspace.windows,
+                bg_rect,
+                CONTENT_INSET,
+                1.0,
+                None,
+            );
+            if let Some(layout) = layout {
+                const MIN_TILE_SIZE: f64 = 2.0;
                 const WIN_GAP: f64 = 0.75;
-                if rw > (2.0 + WIN_GAP) {
-                    rx += WIN_GAP / 2.0;
-                    rw -= WIN_GAP;
+                let mut rects = Vec::with_capacity(workspace.windows.len());
+                for window in workspace.windows.iter().rev() {
+                    let rect = layout.rect_for(window, MIN_TILE_SIZE, WIN_GAP);
+                    rects.push(rect);
                 }
-                if rh > (2.0 + WIN_GAP) {
-                    ry += WIN_GAP / 2.0;
-                    rh -= WIN_GAP;
-                }
-
-                rects.push(WindowRenderRect {
-                    x: rx,
-                    y: ry,
-                    width: rw,
-                    height: rh,
-                });
+                rects
+            } else {
+                Vec::new()
             }
-            rects
         } else {
             Vec::new()
         };
@@ -517,10 +998,10 @@ define_class!(
                         for window in workspace.windows.iter() {
                             add_rounded_rect(
                                 cg,
-                                window.x,
-                                window.y + y_offset,
-                                window.width,
-                                window.height,
+                                window.origin.x,
+                                window.origin.y + y_offset,
+                                window.size.width,
+                                window.size.height,
                                 1.5,
                             );
                             CGContext::set_rgb_fill_color(Some(cg), 1.0, 1.0, 1.0, 1.0);
@@ -532,10 +1013,10 @@ define_class!(
                             CGContext::set_line_width(Some(cg), 1.5);
                             add_rounded_rect(
                                 cg,
-                                window.x,
-                                window.y,
-                                window.width,
-                                window.height,
+                                window.origin.x,
+                                window.origin.y,
+                                window.size.width,
+                                window.size.height,
                                 1.5,
                             );
                             CGContext::stroke_path(Some(cg));

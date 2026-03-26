@@ -222,6 +222,11 @@ impl AXUIElement {
         Ok(AXUIElement::new(element))
     }
 
+    /// Whether this element is the "main" window (AXMain).
+    ///
+    /// This is primarily used by developer tooling and may not be supported by all elements.
+    pub fn main(&self) -> Result<bool> { self.bool_attribute("AXMain") }
+
     pub fn windows(&self) -> Result<Vec<AXUIElement>> {
         let Some(value) = self.copy_attribute("AXWindows")? else {
             return Ok(Vec::new());
@@ -300,9 +305,33 @@ impl AXUIElement {
         self.set_attribute_value(attr.as_ref(), cf_bool.as_ref())
     }
 
-    pub fn can_move(&self) -> Result<bool> { self.bool_attribute("AXPosition") }
+    pub fn can_move(&self) -> Result<bool> { self.is_settable("AXPosition") }
 
-    pub fn can_resize(&self) -> Result<bool> { self.bool_attribute("AXSize") }
+    pub fn can_resize(&self) -> Result<bool> { self.is_settable("AXSize") }
+
+    #[allow(unused)]
+    pub fn element_at_position(point: CGPoint) -> Option<Self> {
+        let mut out_ptr: *const RawAXUIElement = std::ptr::null();
+        let status = unsafe {
+            RawAXUIElement::copy_element_at_position(
+                &*RawAXUIElement::new_system_wide(),
+                point.x as f32,
+                point.y as f32,
+                std::ptr::NonNull::new_unchecked(&mut out_ptr),
+            )
+        };
+        if status == AXError::Success && !out_ptr.is_null() {
+            let retained = unsafe {
+                CFRetained::from_raw(
+                    std::ptr::NonNull::new(out_ptr as *mut RawAXUIElement)
+                        .expect("non-null AXUIElement pointer"),
+                )
+            };
+            return Some(Self::new(retained));
+        }
+
+        None
+    }
 }
 
 impl Deref for AXUIElement {

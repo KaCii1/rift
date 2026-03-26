@@ -1,18 +1,18 @@
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::sync::Arc;
+use std::thread;
 
+use crossbeam_channel::{Sender, TrySendError, bounded};
 use dashmap::DashMap;
-use dispatchr::queue;
-use dispatchr::time::Time;
+use dashmap::mapref::entry::Entry;
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
 use tracing::{debug, error, info, warn};
 
 use crate::actor::broadcast::BroadcastEvent;
 use crate::common::collections::{HashMap, HashSet};
-use crate::sys::dispatch::DispatchExt;
-use crate::sys::mach::mach_send_message;
+use crate::sys::mach::{mach_release_send_right, mach_retain_send_right, mach_try_send_message};
 
 pub type ClientPort = u32;
 
@@ -23,39 +23,70 @@ pub struct CliSubscription {
 }
 
 pub struct ServerState {
-    subscriptions_by_client: DashMap<ClientPort, Vec<String>>,
-    subscriptions_by_event: DashMap<String, Vec<ClientPort>>,
-    cli_subscriptions: Mutex<HashMap<String, Vec<CliSubscription>>>,
+    subscriptions_by_client: Arc<DashMap<ClientPort, Vec<String>>>,
+    subscriptions_by_event: Arc<DashMap<String, Vec<ClientPort>>>,
+    cli_subscriptions: Arc<Mutex<HashMap<String, Vec<CliSubscription>>>>,
+    event_dispatch_tx: Sender<DispatchBatch>,
 }
 
 pub type SharedServerState = Arc<RwLock<ServerState>>;
 
+const EVENT_DISPATCH_QUEUE_CAPACITY: usize = 4096;
+
+struct DispatchBatch {
+    event_json: String,
+    targets: Vec<ClientPort>,
+}
+
 impl ServerState {
     pub fn new() -> Self {
+        let subscriptions_by_client = Arc::new(DashMap::new());
+        let subscriptions_by_event = Arc::new(DashMap::new());
+        let cli_subscriptions = Arc::new(Mutex::new(HashMap::default()));
+        let (event_dispatch_tx, event_dispatch_rx) = bounded(EVENT_DISPATCH_QUEUE_CAPACITY);
+
+        let worker_subscriptions_by_client = Arc::clone(&subscriptions_by_client);
+        let worker_subscriptions_by_event = Arc::clone(&subscriptions_by_event);
+        thread::spawn(move || {
+            Self::run_event_dispatch_worker(
+                event_dispatch_rx,
+                worker_subscriptions_by_client,
+                worker_subscriptions_by_event,
+            );
+        });
+
         Self {
-            subscriptions_by_client: DashMap::new(),
-            subscriptions_by_event: DashMap::new(),
-            cli_subscriptions: Mutex::new(HashMap::default()),
+            subscriptions_by_client,
+            subscriptions_by_event,
+            cli_subscriptions,
+            event_dispatch_tx,
         }
     }
 
     pub fn subscribe_client(&self, client_port: ClientPort, event: String) {
         info!("Client {} subscribing to event: {}", client_port, event);
         let mut added = false;
-        self.subscriptions_by_client
-            .entry(client_port)
-            .and_modify(|subs| {
+        let mut should_retain_send_right = false;
+
+        match self.subscriptions_by_client.entry(client_port) {
+            Entry::Occupied(mut entry) => {
+                let subs = entry.get_mut();
                 if !subs.contains(&event) {
                     subs.push(event.clone());
                     added = true;
                 }
-            })
-            .or_insert_with(|| {
+            }
+            Entry::Vacant(entry) => {
                 added = true;
-                vec![event.clone()]
-            });
+                should_retain_send_right = true;
+                entry.insert(vec![event.clone()]);
+            }
+        }
 
         if added {
+            if should_retain_send_right {
+                let _ = unsafe { mach_retain_send_right(client_port) };
+            }
             self.subscriptions_by_event
                 .entry(event.clone())
                 .and_modify(|clients| {
@@ -71,13 +102,16 @@ impl ServerState {
     pub fn unsubscribe_client(&self, client_port: ClientPort, event: String) {
         info!("Client {} unsubscribing from event: {}", client_port, event);
         let mut removed = false;
+        let mut removed_client_entry = false;
 
         if let Some(mut entry) = self.subscriptions_by_client.get_mut(&client_port) {
+            let old_len = entry.len();
             entry.retain(|e| e != &event);
-            removed = true;
+            removed = entry.len() != old_len;
             if entry.is_empty() {
                 drop(entry);
                 self.subscriptions_by_client.remove(&client_port);
+                removed_client_entry = true;
             }
         }
 
@@ -89,6 +123,10 @@ impl ServerState {
                     self.subscriptions_by_event.remove(&event);
                 }
             }
+        }
+
+        if removed_client_entry {
+            let _ = unsafe { mach_release_send_right(client_port) };
         }
     }
 
@@ -148,6 +186,7 @@ impl ServerState {
             BroadcastEvent::WorkspaceChanged { .. } => "workspace_changed",
             BroadcastEvent::WindowsChanged { .. } => "windows_changed",
             BroadcastEvent::WindowTitleChanged { .. } => "window_title_changed",
+            BroadcastEvent::StacksChanged { .. } => "stacks_changed",
         };
 
         let mut targets: HashSet<ClientPort> = HashSet::default();
@@ -170,8 +209,23 @@ impl ServerState {
             }
         };
 
-        for client_port in targets {
-            schedule_event_send(client_port, event_json.clone());
+        let batch = DispatchBatch {
+            event_json,
+            targets: targets.into_iter().collect(),
+        };
+
+        if let Err(err) = self.event_dispatch_tx.try_send(batch) {
+            match err {
+                TrySendError::Full(_) => {
+                    warn!(
+                        "Dropping IPC event batch: dispatch queue full (capacity={})",
+                        EVENT_DISPATCH_QUEUE_CAPACITY
+                    );
+                }
+                TrySendError::Disconnected(_) => {
+                    error!("Dropping IPC event batch: dispatch worker channel disconnected");
+                }
+            }
         }
     }
 
@@ -180,6 +234,7 @@ impl ServerState {
             BroadcastEvent::WorkspaceChanged { .. } => "workspace_changed",
             BroadcastEvent::WindowsChanged { .. } => "windows_changed",
             BroadcastEvent::WindowTitleChanged { .. } => "window_title_changed",
+            BroadcastEvent::StacksChanged { .. } => "stacks_changed",
         };
 
         // Collect relevant subscriptions without full HashMap clone
@@ -199,47 +254,74 @@ impl ServerState {
         }
     }
 
-    fn send_event_to_client(client_port: ClientPort, event_json: &str) {
-        let c_message = CString::new(event_json).unwrap_or_default();
+    fn send_event_to_client(client_port: ClientPort, c_message: &CString) -> bool {
         let bytes = c_message.as_bytes_with_nul();
         unsafe {
-            let result = mach_send_message(
+            let result = mach_try_send_message(
                 client_port,
-                c_message.as_ptr() as *mut c_char,
+                c_message.as_ptr() as *const c_char,
                 bytes.len() as u32,
-                false,
-                None,
             );
             if !result {
                 warn!("Failed to send event to client {}", client_port);
+                return false;
             } else {
                 debug!("Successfully sent event to client {}", client_port);
+                return true;
             }
         }
     }
 
     pub fn remove_client(&self, client_port: ClientPort) {
-        if let Some((_k, events)) = self.subscriptions_by_client.remove(&client_port) {
-            for event in events {
-                if let Some(mut entry) = self.subscriptions_by_event.get_mut(&event) {
-                    entry.retain(|c| c != &client_port);
-                    if entry.is_empty() {
-                        drop(entry);
-                        self.subscriptions_by_event.remove(&event);
-                    }
+        Self::remove_client_from_maps(
+            client_port,
+            &self.subscriptions_by_client,
+            &self.subscriptions_by_event,
+        );
+    }
+
+    fn run_event_dispatch_worker(
+        event_dispatch_rx: crossbeam_channel::Receiver<DispatchBatch>,
+        subscriptions_by_client: Arc<DashMap<ClientPort, Vec<String>>>,
+        subscriptions_by_event: Arc<DashMap<String, Vec<ClientPort>>>,
+    ) {
+        while let Ok(batch) = event_dispatch_rx.recv() {
+            let c_message = match CString::new(batch.event_json) {
+                Ok(message) => message,
+                Err(e) => {
+                    error!("Failed to encode IPC event payload: {}", e);
+                    continue;
+                }
+            };
+
+            for client_port in batch.targets {
+                if !Self::send_event_to_client(client_port, &c_message) {
+                    Self::remove_client_from_maps(
+                        client_port,
+                        &subscriptions_by_client,
+                        &subscriptions_by_event,
+                    );
                 }
             }
         }
     }
-}
 
-fn schedule_event_send(client_port: ClientPort, event_json: String) {
-    match queue::global(dispatchr::QoS::Utility) {
-        Some(q) => q.after_f_s(
-            Time::new_after(Time::NOW, (0.1 * 1000000.0) as i64),
-            (client_port, event_json),
-            |(client_port, event_json)| ServerState::send_event_to_client(client_port, &event_json),
-        ),
-        None => ServerState::send_event_to_client(client_port, &event_json),
+    fn remove_client_from_maps(
+        client_port: ClientPort,
+        subscriptions_by_client: &DashMap<ClientPort, Vec<String>>,
+        subscriptions_by_event: &DashMap<String, Vec<ClientPort>>,
+    ) {
+        if let Some((_k, events)) = subscriptions_by_client.remove(&client_port) {
+            for event in events {
+                if let Some(mut entry) = subscriptions_by_event.get_mut(&event) {
+                    entry.retain(|c| c != &client_port);
+                    if entry.is_empty() {
+                        drop(entry);
+                        subscriptions_by_event.remove(&event);
+                    }
+                }
+            }
+            let _ = unsafe { mach_release_send_right(client_port) };
+        }
     }
 }

@@ -4,12 +4,14 @@ use tracing::{debug, trace, warn};
 use crate::actor::app::WindowId;
 use crate::actor::reactor::events::drag::DragEventHandler;
 use crate::actor::reactor::{
-    DragState, MissionControlState, Quiet, Reactor, Requested, TransactionId, WindowState, utils,
+    DragState, Quiet, Reactor, Requested, TransactionId, WindowFilter, WindowState, utils,
 };
+use crate::common::config::LayoutMode;
 use crate::layout_engine::LayoutEvent;
 use crate::sys::app::WindowInfo as Window;
 use crate::sys::event::{MouseState, get_mouse_state};
 use crate::sys::geometry::SameAs;
+use crate::sys::screen::SpaceId;
 use crate::sys::window_server::{WindowServerId, WindowServerInfo};
 
 pub struct WindowEventHandler;
@@ -22,7 +24,6 @@ impl WindowEventHandler {
         ws_info: Option<WindowServerInfo>,
         _mouse_state: Option<MouseState>,
     ) {
-        // FIXME: We assume all windows are on the main screen.
         if let Some(wsid) = window.sys_id {
             reactor.window_manager.window_ids.insert(wsid, wid);
             reactor.window_manager.observed_window_server_ids.remove(&wsid);
@@ -35,14 +36,14 @@ impl WindowEventHandler {
         let frame = window.frame;
         let mut window_state: WindowState = window.into();
         let is_manageable = utils::compute_window_manageability(
-            window_state.window_server_id,
-            window_state.is_minimized,
-            window_state.is_ax_standard,
-            window_state.is_ax_root,
+            window_state.info.sys_id,
+            window_state.info.is_minimized,
+            window_state.info.is_standard,
+            window_state.info.is_root,
             &reactor.window_server_info_manager.window_server_info,
         );
         window_state.is_manageable = is_manageable;
-        if let Some(wsid) = window_state.window_server_id {
+        if let Some(wsid) = window_state.info.sys_id {
             reactor.transaction_manager.store_txid(
                 wsid,
                 reactor.transaction_manager.get_last_sent_txid(wsid),
@@ -50,22 +51,21 @@ impl WindowEventHandler {
             );
         }
 
-        let server_id = window_state.window_server_id;
+        let server_id = window_state.info.sys_id;
         reactor.window_manager.windows.insert(wid, window_state);
 
         if is_manageable {
-            if let Some(space) = reactor.best_space_for_window(&frame, server_id) {
-                if reactor.is_space_active(space) {
-                    if let Some(app_info) =
-                        reactor.app_manager.apps.get(&wid.pid).map(|app| app.info.clone())
-                    {
-                        if let Some(wsid) = server_id {
-                            reactor.app_manager.mark_wsids_recent(std::iter::once(wsid));
-                        }
-                        reactor.process_windows_for_app_rules(wid.pid, vec![wid], app_info);
+            let active_space = active_space_for_window(reactor, &frame, server_id);
+            if let Some(space) = active_space {
+                if let Some(app_info) =
+                    reactor.app_manager.apps.get(&wid.pid).map(|app| app.info.clone())
+                {
+                    if let Some(wsid) = server_id {
+                        reactor.app_manager.mark_wsids_recent(std::iter::once(wsid));
                     }
-                    reactor.send_layout_event(LayoutEvent::WindowAdded(space, wid));
+                    reactor.process_windows_for_app_rules(wid.pid, vec![wid], app_info);
                 }
+                maybe_dispatch_window_added_in_space(reactor, wid, space);
             }
         }
         // TODO: drag state is maybe managed by ensure_active_drag
@@ -75,11 +75,10 @@ impl WindowEventHandler {
     }
 
     pub fn handle_window_destroyed(reactor: &mut Reactor, wid: WindowId) -> bool {
-        if !reactor.window_manager.windows.contains_key(&wid) {
-            return false;
-        }
-        let window_server_id =
-            reactor.window_manager.windows.get(&wid).and_then(|w| w.window_server_id);
+        let window_server_id = match reactor.window_manager.windows.get(&wid) {
+            Some(window) => window.info.sys_id,
+            None => return false,
+        };
         if let Some(ws_id) = window_server_id {
             reactor.transaction_manager.remove_for_window(ws_id);
             reactor.window_manager.window_ids.remove(&ws_id);
@@ -118,12 +117,12 @@ impl WindowEventHandler {
 
     pub fn handle_window_minimized(reactor: &mut Reactor, wid: WindowId) {
         if let Some(window) = reactor.window_manager.windows.get_mut(&wid) {
-            if window.is_minimized {
+            if window.info.is_minimized {
                 return;
             }
-            window.is_minimized = true;
+            window.info.is_minimized = true;
             window.is_manageable = false;
-            if let Some(ws_id) = window.window_server_id {
+            if let Some(ws_id) = window.info.sys_id {
                 reactor.window_manager.visible_windows.remove(&ws_id);
             }
             reactor.send_layout_event(LayoutEvent::WindowRemoved(wid));
@@ -136,15 +135,15 @@ impl WindowEventHandler {
         let (frame, server_id, is_ax_standard, is_ax_root) =
             match reactor.window_manager.windows.get_mut(&wid) {
                 Some(window) => {
-                    if !window.is_minimized {
+                    if !window.info.is_minimized {
                         return;
                     }
-                    window.is_minimized = false;
+                    window.info.is_minimized = false;
                     (
                         window.frame_monotonic,
-                        window.window_server_id,
-                        window.is_ax_standard,
-                        window.is_ax_root,
+                        window.info.sys_id,
+                        window.info.is_standard,
+                        window.info.is_root,
                     )
                 }
                 None => {
@@ -167,10 +166,9 @@ impl WindowEventHandler {
         }
 
         if is_manageable {
-            if let Some(space) = reactor.best_space_for_window(&frame, server_id) {
-                if reactor.is_space_active(space) {
-                    reactor.send_layout_event(LayoutEvent::WindowAdded(space, wid));
-                }
+            let active_space = active_space_for_window(reactor, &frame, server_id);
+            if let Some(space) = active_space {
+                maybe_dispatch_window_added_in_space(reactor, wid, space);
             }
         }
     }
@@ -194,64 +192,56 @@ impl WindowEventHandler {
         );
 
         let effective_mouse_state = mouse_state.or_else(|| get_mouse_state());
-        let event_mouse_state = mouse_state;
         let result = (|| -> bool {
-            let Some(window) = reactor.window_manager.windows.get_mut(&wid) else {
-                return false;
+            let (server_id, old_frame) = {
+                let Some(window) = reactor.window_manager.windows.get(&wid) else {
+                    return false;
+                };
+
+                if reactor.is_mission_control_active() {
+                    return false;
+                }
+
+                (window.info.sys_id, window.frame_monotonic)
             };
-            if matches!(
-                reactor.mission_control_manager.mission_control_state,
-                MissionControlState::Active
-            ) || window
-                .window_server_id
-                .is_some_and(|wsid| reactor.space_manager.changing_screens.contains(&wsid))
-            {
-                return false;
-            }
-            let pending_target = window.window_server_id.and_then(|wsid| {
+
+            let pending_target = server_id.and_then(|wsid| {
                 reactor.transaction_manager.get_target_frame(wsid).map(|target| (wsid, target))
             });
 
-            let last_sent_txid = window
-                .window_server_id
+            let last_sent_txid = server_id
                 .map(|wsid| reactor.transaction_manager.get_last_sent_txid(wsid))
                 .unwrap_or_default();
+
             let mut has_pending_request = pending_target.is_some();
             let mut triggered_by_rift =
                 has_pending_request && last_seen.is_some_and(|seen| seen == last_sent_txid);
 
-            if event_mouse_state == Some(MouseState::Down) && triggered_by_rift {
+            if effective_mouse_state == Some(MouseState::Down) && triggered_by_rift {
                 if let Some((wsid, _)) = pending_target {
-                    reactor.transaction_manager.remove_for_window(wsid);
+                    reactor.transaction_manager.clear_target_for_window(wsid);
                 }
                 triggered_by_rift = false;
                 has_pending_request = false;
             }
-            if has_pending_request {
-                if let Some(last_seen) = last_seen
-                    && last_seen != last_sent_txid
-                {
-                    // Ignore events that happened before the last time we
-                    // changed the size or position of this window. Otherwise
-                    // we would update the layout model incorrectly.
-                    debug!(?last_seen, ?last_sent_txid, "Ignoring frame change");
-                    return false;
-                }
-            }
-            if requested.0 {
-                // TODO: If the size is different from requested, applying a
-                // correction to the model can result in weird feedback
-                // loops, so we ignore these for now.
+
+            if has_pending_request && last_seen.is_some_and(|seen| seen != last_sent_txid) {
+                debug!(?last_seen, ?last_sent_txid, "Ignoring frame change");
                 return false;
             }
+
             if triggered_by_rift {
+                let Some(window) = reactor.window_manager.windows.get_mut(&wid) else {
+                    return false;
+                };
+
                 if let Some((wsid, target)) = pending_target {
                     if new_frame.same_as(target) {
                         if !window.frame_monotonic.same_as(new_frame) {
                             debug!(?wid, ?new_frame, "Final frame matches Rift request");
                             window.frame_monotonic = new_frame;
                         }
-                        reactor.transaction_manager.remove_for_window(wsid);
+                        reactor.transaction_manager.clear_target_for_window(wsid);
                     } else {
                         trace!(
                             ?wid,
@@ -267,120 +257,139 @@ impl WindowEventHandler {
                         "Rift frame event missing tx record; updating state"
                     );
                     window.frame_monotonic = new_frame;
-                    if let Some(wsid) = window.window_server_id {
-                        reactor.transaction_manager.remove_for_window(wsid);
+                    if let Some(wsid) = window.info.sys_id {
+                        reactor.transaction_manager.clear_target_for_window(wsid);
                     }
-                } else if !window.frame_monotonic.same_as(new_frame) {
-                    debug!(
-                        ?wid,
-                        ?new_frame,
-                        "Rift frame event without store; updating state"
-                    );
-                    window.frame_monotonic = new_frame;
+                }
+
+                return false;
+            }
+
+            if requested.0 {
+                if let Some(window) = reactor.window_manager.windows.get_mut(&wid) {
+                    if !window.frame_monotonic.same_as(new_frame) {
+                        debug!(
+                            ?wid,
+                            ?new_frame,
+                            "Requested frame change without pending tx; syncing state"
+                        );
+                        window.frame_monotonic = new_frame;
+                    }
+                }
+                if let Some(wsid) = server_id {
+                    reactor.transaction_manager.clear_target_for_window(wsid);
                 }
                 return false;
             }
-            let old_frame = std::mem::replace(&mut window.frame_monotonic, new_frame);
-            if old_frame == new_frame {
+
+            let old_space = reactor.best_space_for_window(&old_frame, server_id);
+            let new_space = reactor.best_space_for_window(&new_frame, server_id);
+            let old_active = old_space.is_some_and(|space| reactor.is_space_active(space));
+            let new_active = new_space.is_some_and(|space| reactor.is_space_active(space));
+
+            if !old_active && !new_active {
                 return false;
             }
 
-            let dragging = event_mouse_state == Some(MouseState::Down)
-                || matches!(
-                    reactor.drag_manager.drag_state,
-                    DragState::Active { .. } | DragState::PendingSwap { .. }
-                );
+            {
+                let Some(window) = reactor.window_manager.windows.get_mut(&wid) else {
+                    return false;
+                };
+                if window.frame_monotonic.same_as(new_frame) {
+                    return false;
+                }
+                window.frame_monotonic = new_frame;
+            }
 
-            if !dragging && !triggered_by_rift {
+            let dragging = effective_mouse_state == Some(MouseState::Down) || reactor.is_in_drag();
+
+            if !dragging {
                 reactor.drag_manager.skip_layout_for_window = Some(wid);
             }
 
             if dragging {
                 reactor.ensure_active_drag(wid, &old_frame);
                 reactor.update_active_drag(wid, &new_frame);
-                if old_frame.size != new_frame.size {
-                    reactor.mark_drag_dirty(wid);
+                let is_resize = !old_frame.size.same_as(new_frame.size);
+                if is_resize {
+                    if active_space_for_window(reactor, &new_frame, server_id).is_some() {
+                        let screens = reactor
+                            .space_manager
+                            .screens
+                            .iter()
+                            .filter_map(|screen| {
+                                let display_uuid = screen.display_uuid_owned();
+                                Some((screen.space?, screen.frame, display_uuid))
+                            })
+                            .collect::<Vec<_>>();
+                        reactor.send_layout_event(LayoutEvent::WindowResized {
+                            wid,
+                            old_frame,
+                            new_frame,
+                            screens,
+                        });
+                    }
+                } else {
+                    reactor.maybe_swap_on_drag(wid, new_frame);
                 }
-                reactor.maybe_swap_on_drag(wid, new_frame);
             } else {
-                let screens = reactor
-                    .space_manager
-                    .screens
-                    .iter()
-                    .filter_map(|screen| {
-                        let space = reactor.space_manager.space_for_screen(screen)?;
-                        let display_uuid = if screen.display_uuid.is_empty() {
-                            None
-                        } else {
-                            Some(screen.display_uuid.clone())
-                        };
-                        Some((space, screen.frame, display_uuid))
-                    })
-                    .collect::<Vec<_>>();
-
-                let server_id = window.window_server_id;
-                let old_space = reactor.best_space_for_window(&old_frame, server_id);
-                let new_space = reactor.best_space_for_window(&new_frame, server_id);
-
                 if old_space != new_space {
-                    if matches!(
-                        reactor.drag_manager.drag_state,
-                        DragState::Active { .. } | DragState::PendingSwap { .. }
-                    ) || matches!(
-                        &reactor.drag_manager.drag_state,
-                        DragState::Active { session } if session.window == wid
-                    ) {
-                        if let Some(space) = new_space {
-                            if let DragState::Active { session } =
-                                &mut reactor.drag_manager.drag_state
+                    let keep_assigned_for_scrolling = old_space.is_some_and(|space| {
+                        reactor.layout_manager.layout_engine.active_layout_mode_at(space)
+                            == LayoutMode::Scrolling
+                            && !reactor.layout_manager.layout_engine.is_window_floating(wid)
+                            && reactor
+                                .layout_manager
+                                .layout_engine
+                                .virtual_workspace_manager()
+                                .workspace_for_window(space, wid)
+                                .is_some()
+                    });
+                    if keep_assigned_for_scrolling {
+                        debug!(
+                            ?wid,
+                            ?old_space,
+                            ?new_space,
+                            "Ignoring geometry-only space change for scrolling tiled window"
+                        );
+                        return false;
+                    }
+
+                    reactor.send_layout_event(LayoutEvent::WindowRemovedPreserveFloating(wid));
+                    if let Some(space) = new_space {
+                        if reactor.is_space_active(space) {
+                            if let Some(active_ws) =
+                                reactor.layout_manager.layout_engine.active_workspace(space)
                             {
-                                if session.window == wid {
-                                    session.settled_space = Some(space);
-                                    session.layout_dirty = true;
+                                let assigned = reactor
+                                    .layout_manager
+                                    .layout_engine
+                                    .virtual_workspace_manager_mut()
+                                    .assign_window_to_workspace(space, wid, active_ws);
+                                if !assigned {
+                                    warn!(
+                                        "Failed to assign window {:?} to workspace {:?}",
+                                        wid, active_ws
+                                    );
                                 }
                             }
-                        }
-                    } else {
-                        if let Some(space) = new_space {
-                            if reactor.is_space_active(space) {
-                                if let Some(active_ws) =
-                                    reactor.layout_manager.layout_engine.active_workspace(space)
-                                {
-                                    let assigned = reactor
-                                        .layout_manager
-                                        .layout_engine
-                                        .virtual_workspace_manager_mut()
-                                        .assign_window_to_workspace(space, wid, active_ws);
-                                    if !assigned {
-                                        warn!(
-                                            "Failed to assign window {:?} to workspace {:?}",
-                                            wid, active_ws
-                                        );
-                                    }
-                                }
-                                reactor.send_layout_event(LayoutEvent::WindowAdded(space, wid));
-                                let _ = reactor.update_layout(false, false).unwrap_or_else(|e| {
-                                    warn!("Layout update failed: {}", e);
-                                    false
-                                });
-                            } else {
-                                reactor.send_layout_event(LayoutEvent::WindowRemoved(wid));
-                                let _ = reactor.update_layout(false, false).unwrap_or_else(|e| {
-                                    warn!("Layout update failed: {}", e);
-                                    false
-                                });
-                            }
-                        } else {
-                            reactor.send_layout_event(LayoutEvent::WindowRemoved(wid));
-                            let _ = reactor.update_layout(false, false).unwrap_or_else(|e| {
-                                warn!("Layout update failed: {}", e);
-                                false
-                            });
+                            reactor.send_layout_event(LayoutEvent::WindowAdded(space, wid));
                         }
                     }
-                } else if old_frame.size != new_frame.size {
+                    let _ = reactor.update_layout_or_warn(false, false);
+                } else if !old_frame.size.same_as(new_frame.size) {
                     if let Some(space) = old_space {
                         if reactor.is_space_active(space) {
+                            let screens = reactor
+                                .space_manager
+                                .screens
+                                .iter()
+                                .filter_map(|screen| {
+                                    let space = screen.space?;
+                                    let display_uuid = screen.display_uuid_owned();
+                                    Some((space, screen.frame, display_uuid))
+                                })
+                                .collect::<Vec<_>>();
                             reactor.send_layout_event(LayoutEvent::WindowResized {
                                 wid,
                                 old_frame,
@@ -401,11 +410,11 @@ impl WindowEventHandler {
 
     pub fn handle_window_title_changed(reactor: &mut Reactor, wid: WindowId, new_title: String) {
         if let Some(window) = reactor.window_manager.windows.get_mut(&wid) {
-            let previous_title = window.title.clone();
+            let previous_title = window.info.title.clone();
             if previous_title == new_title {
                 return;
             }
-            window.title = new_title.clone();
+            window.info.title = new_title.clone();
             reactor.broadcast_window_title_changed(wid, previous_title, new_title);
             reactor.maybe_reapply_app_rules_for_window(wid);
         }
@@ -421,15 +430,44 @@ impl WindowEventHandler {
 
         reactor.raise_window(wid, Quiet::No, None);
 
-        let space = reactor.window_manager.windows.get(&wid).and_then(|window| {
-            reactor.best_space_for_window(&window.frame_monotonic, window.window_server_id)
-        });
-
-        if let Some(space) = space {
-            if reactor.is_space_active(space) {
+        if let Some(window) = reactor.window_manager.windows.get(&wid) {
+            if let Some(space) =
+                active_space_for_window(reactor, &window.frame_monotonic, window.info.sys_id)
+            {
                 reactor.send_layout_event(LayoutEvent::WindowFocused(space, wid));
             }
         }
+    }
+}
+
+fn active_space_for_window(
+    reactor: &Reactor,
+    frame: &CGRect,
+    server_id: Option<WindowServerId>,
+) -> Option<SpaceId> {
+    let best = reactor.best_space_for_window(frame, server_id);
+    if let Some(space) = best.filter(|space| reactor.is_space_active(*space)) {
+        return Some(space);
+    }
+
+    // Some apps publish AX windows before the window server id/space is ready.
+    // Fall back to the active command context so new windows land on the intended display.
+    if server_id.is_none() {
+        return reactor.workspace_command_space();
+    }
+
+    None
+}
+
+fn maybe_dispatch_window_added_in_space(reactor: &mut Reactor, wid: WindowId, space: SpaceId) {
+    let should_dispatch = reactor
+        .window_manager
+        .windows
+        .get(&wid)
+        .map(|window| window.matches_filter(WindowFilter::EffectivelyManageable))
+        .unwrap_or(false);
+    if should_dispatch {
+        reactor.send_layout_event(LayoutEvent::WindowAdded(space, wid));
     }
 }
 

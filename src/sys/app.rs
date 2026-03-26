@@ -1,17 +1,16 @@
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use dispatchr::queue;
-use dispatchr::time::Time;
 pub use nix::libc::pid_t;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication, NSWorkspace};
-use objc2_core_foundation::CGRect;
+use objc2_core_foundation::{CGRect, CGSize};
 use objc2_foundation::{NSCopying, NSObject, NSObjectProtocol, NSString, ns_string};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -22,7 +21,6 @@ use super::window_server::{WindowServerId, WindowServerInfo};
 use crate::sys::axuielement::{
     AX_STANDARD_WINDOW_SUBROLE, AX_WINDOW_ROLE, AXUIElement, Error as AxError,
 };
-use crate::sys::dispatch::DispatchExt;
 
 const NS_KEY_VALUE_OBSERVING_OPTION_NEW: usize = 1 << 0;
 const NS_KEY_VALUE_OBSERVING_OPTION_INITIAL: usize = 1 << 2;
@@ -101,8 +99,11 @@ impl ActivationPolicyObserver {
             ivars.notified.set(true);
             (ivars.handler.clone(), ivars.info.clone(), ivars.pid)
         };
-        callback(pid, info);
-        schedule_observer_cleanup(pid);
+
+        remove_activation_policy_observer(pid);
+        remove_finished_launching_observer(pid);
+
+        notify_ready_once(&callback, pid, info);
     }
 }
 
@@ -191,8 +192,11 @@ impl FinishedLaunchingObserver {
             ivars.notified.set(true);
             (ivars.handler.clone(), ivars.info.clone(), ivars.pid)
         };
-        callback(pid, info);
-        schedule_observer_cleanup(pid);
+
+        remove_finished_launching_observer(pid);
+        remove_activation_policy_observer(pid);
+
+        notify_ready_once(&callback, pid, info);
     }
 }
 
@@ -209,32 +213,6 @@ impl Drop for FinishedLaunchingObserver {
     }
 }
 
-struct CleanupCtx(pid_t);
-
-extern "C" fn cleanup_observer(ctx: *mut c_void) {
-    if ctx.is_null() {
-        return;
-    }
-    let pid = unsafe { Box::from_raw(ctx as *mut CleanupCtx).0 };
-    if let Some(observer) = ACTIVATION_POLICY_OBSERVERS.lock().remove(&pid) {
-        unsafe {
-            let ptr = observer as *mut ActivationPolicyObserver;
-            let _ = Retained::from_raw(ptr);
-        }
-    }
-    if let Some(observer) = FINISHED_LAUNCHING_OBSERVERS.lock().remove(&pid) {
-        unsafe {
-            let ptr = observer as *mut FinishedLaunchingObserver;
-            let _ = Retained::from_raw(ptr);
-        }
-    }
-}
-
-fn schedule_observer_cleanup(pid: pid_t) {
-    let ctx = Box::new(CleanupCtx(pid));
-    queue::main().after_f(Time::NOW, Box::into_raw(ctx) as *mut c_void, cleanup_observer);
-}
-
 static ACTIVATION_POLICY_CALLBACK: Lazy<Mutex<Option<ActivationPolicyCallback>>> =
     Lazy::new(|| Mutex::new(None));
 
@@ -246,6 +224,16 @@ static FINISHED_LAUNCHING_CALLBACK: Lazy<Mutex<Option<ActivationPolicyCallback>>
 
 static FINISHED_LAUNCHING_OBSERVERS: Lazy<Mutex<HashMap<pid_t, usize>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+static READY_CALLBACK_NOTIFIED: Lazy<Mutex<HashSet<pid_t>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
+
+fn notify_ready_once(callback: &ActivationPolicyCallback, pid: pid_t, info: AppInfo) {
+    if !READY_CALLBACK_NOTIFIED.lock().insert(pid) {
+        return;
+    }
+    callback(pid, info);
+}
 
 pub fn set_activation_policy_callback<F>(callback: F)
 where F: Fn(pid_t, AppInfo) + Send + Sync + 'static {
@@ -266,14 +254,19 @@ pub fn ensure_activation_policy_observer(pid: pid_t, info: AppInfo) {
     let Some(callback) = callback else {
         return;
     };
-    if ACTIVATION_POLICY_OBSERVERS.lock().contains_key(&pid) {
+    let mut observers = ACTIVATION_POLICY_OBSERVERS.lock();
+    if observers.contains_key(&pid) {
         return;
     }
     let Some(app) = NSRunningApplication::with_process_id(pid) else {
-        callback(pid, info);
+        drop(observers);
+        remove_activation_policy_observer(pid);
+        notify_ready_once(&callback, pid, info);
         return;
     };
-    observe_activation_policy(app, info, callback);
+    let observer = ActivationPolicyObserver::new(app, info, callback);
+    let raw = Retained::into_raw(observer);
+    observers.insert(pid, raw as usize);
 }
 
 pub fn ensure_finished_launching_observer(pid: pid_t, info: AppInfo) {
@@ -281,18 +274,22 @@ pub fn ensure_finished_launching_observer(pid: pid_t, info: AppInfo) {
     let Some(callback) = callback else {
         return;
     };
-    if FINISHED_LAUNCHING_OBSERVERS.lock().contains_key(&pid) {
+    let mut observers = FINISHED_LAUNCHING_OBSERVERS.lock();
+    if observers.contains_key(&pid) {
         return;
     }
     let Some(app) = NSRunningApplication::with_process_id(pid) else {
         return;
     };
     if app.isFinishedLaunching() {
-        callback(pid, info);
+        drop(observers);
+        remove_finished_launching_observer(pid);
+        notify_ready_once(&callback, pid, info);
         return;
-    }
-
-    observe_finished_launching(app, info, callback);
+    };
+    let observer = FinishedLaunchingObserver::new(app, info, callback);
+    let raw = Retained::into_raw(observer);
+    observers.insert(pid, raw as usize);
 }
 
 pub fn remove_activation_policy_observer(pid: pid_t) {
@@ -313,37 +310,7 @@ pub fn remove_finished_launching_observer(pid: pid_t) {
     }
 }
 
-fn observe_activation_policy(
-    app: Retained<NSRunningApplication>,
-    info: AppInfo,
-    callback: ActivationPolicyCallback,
-) {
-    let pid = app.pid();
-    {
-        if ACTIVATION_POLICY_OBSERVERS.lock().contains_key(&pid) {
-            return;
-        }
-    }
-    let observer = ActivationPolicyObserver::new(app, info, callback);
-    let raw = Retained::into_raw(observer) as *mut ActivationPolicyObserver;
-    ACTIVATION_POLICY_OBSERVERS.lock().insert(pid, raw as usize);
-}
-
-fn observe_finished_launching(
-    app: Retained<NSRunningApplication>,
-    info: AppInfo,
-    callback: ActivationPolicyCallback,
-) {
-    let pid = app.pid();
-    {
-        if FINISHED_LAUNCHING_OBSERVERS.lock().contains_key(&pid) {
-            return;
-        }
-    }
-    let observer = FinishedLaunchingObserver::new(app, info, callback);
-    let raw = Retained::into_raw(observer) as *mut FinishedLaunchingObserver;
-    FINISHED_LAUNCHING_OBSERVERS.lock().insert(pid, raw as usize);
-}
+pub fn clear_ready_callback_notified(pid: pid_t) { READY_CALLBACK_NOTIFIED.lock().remove(&pid); }
 
 pub fn running_apps(bundle: Option<String>) -> impl Iterator<Item = (pid_t, AppInfo)> {
     let callback = ACTIVATION_POLICY_CALLBACK.lock().clone();
@@ -371,7 +338,13 @@ pub fn running_apps(bundle: Option<String>) -> impl Iterator<Item = (pid_t, AppI
                 && bundle_id.as_deref() != Some("com.apple.loginwindow")
             {
                 if let Some(cb) = callback.clone() {
-                    observe_activation_policy(app, info, cb);
+                    let pid = app.pid();
+                    let mut observers = ACTIVATION_POLICY_OBSERVERS.lock();
+                    if let Entry::Vacant(entry) = observers.entry(pid) {
+                        let observer = ActivationPolicyObserver::new(app, info, cb);
+                        let raw = Retained::into_raw(observer);
+                        entry.insert(raw as usize);
+                    }
                 }
                 return None;
             }
@@ -414,16 +387,22 @@ impl From<&NSRunningApplication> for AppInfo {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WindowInfo {
     pub is_standard: bool,
     #[serde(default)]
     pub is_root: bool,
     #[serde(default)]
     pub is_minimized: bool,
+    #[serde(default)]
+    pub is_resizable: bool,
     pub title: String,
     #[serde(with = "CGRectDef")]
     pub frame: CGRect,
+    #[serde(skip)]
+    pub min_size: Option<CGSize>,
+    #[serde(skip)]
+    pub max_size: Option<CGSize>,
     pub sys_id: Option<WindowServerId>,
     pub bundle_id: Option<String>,
     pub path: Option<PathBuf>,
@@ -449,6 +428,7 @@ impl WindowInfo {
             .map(|info| info.id)
             .or_else(|| WindowServerId::try_from(element).ok());
         let is_minimized = element.minimized().unwrap_or_default();
+        let is_resizable = element.can_resize().unwrap_or(true);
 
         let (bundle_id, path) = if !is_standard {
             (None, None)
@@ -461,10 +441,15 @@ impl WindowInfo {
             (None, None)
         };
 
+        let min_size = server_info.map(|info| info.min_frame).or_else(|| None);
+        let max_size = server_info.map(|info| info.max_frame).or_else(|| None);
         let info = WindowInfo {
             is_standard,
             is_root: true,
             is_minimized,
+            is_resizable,
+            min_size,
+            max_size,
             title: element.title().unwrap_or_default(),
             frame,
             sys_id: id,

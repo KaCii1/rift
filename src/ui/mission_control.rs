@@ -11,9 +11,9 @@ use objc2::msg_send;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{NSApplication, NSColor, NSPopUpMenuWindowLevel, NSScreen};
-use objc2_core_foundation::{CFRetained, CFString, CFType, CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{CFRetained, CFString, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
-    CGColor, CGContext, CGDisplayBounds, CGEvent, CGEventField, CGEventFlags, CGEventTapOptions,
+    CGColor, CGDisplayBounds, CGEvent, CGEventField, CGEventFlags, CGEventTapOptions,
     CGEventTapProxy, CGEventType,
 };
 use objc2_foundation::MainThreadMarker;
@@ -31,25 +31,18 @@ use crate::sys::cgs_window::CgsWindow;
 use crate::sys::dispatch::DispatchExt;
 use crate::sys::event::current_cursor_location;
 use crate::sys::geometry::CGRectExt;
-use crate::sys::screen::{CoordinateConverter, NSScreenExt, ScreenCache, ScreenId};
-use crate::sys::skylight::{
-    CFRelease, G_CONNECTION, SLSFlushWindowContentRegion, SLWindowContextCreate,
+use crate::sys::screen::{
+    CoordinateConverter, NSScreenExt, ScreenCache, ScreenId, ScreenInfo, get_active_space_number,
 };
 use crate::sys::window_server::{CapturedWindowImage, WindowServerId};
-
-unsafe extern "C" {
-    fn CGContextFlush(ctx: *mut CGContext);
-    fn CGContextClearRect(ctx: *mut CGContext, rect: CGRect);
-    fn CGContextSaveGState(ctx: *mut CGContext);
-    fn CGContextRestoreGState(ctx: *mut CGContext);
-    fn CGContextTranslateCTM(ctx: *mut CGContext, tx: f64, ty: f64);
-    fn CGContextScaleCTM(ctx: *mut CGContext, sx: f64, sy: f64);
-}
+use crate::ui::common::{
+    compute_window_layout_metrics, render_layer_to_cgs_window, with_disabled_actions,
+};
 
 #[derive(Debug, Clone)]
 struct CaptureTask {
     window_id: WindowId,
-    window_server_id: u32,
+    window_server_id: WindowServerId,
     target_w: usize,
     target_h: usize,
 }
@@ -91,7 +84,7 @@ static CAPTURE_POOL: Lazy<CapturePool> = Lazy::new(|| {
                 }
 
                 if let Some(img) = crate::sys::window_server::capture_window_image(
-                    WindowServerId::new(job.task.window_server_id),
+                    job.task.window_server_id,
                     job.task.target_w,
                     job.task.target_h,
                 ) {
@@ -536,77 +529,34 @@ impl WorkspaceGrid {
     }
 }
 
-struct WindowLayoutMetrics {
-    scale: f64,
-    x_offset: f64,
-    y_offset: f64,
-    min_x: f64,
-    min_y: f64,
-    disp_h: f64,
-}
-
 #[derive(Clone, Copy)]
 enum WindowLayoutKind {
     PreserveOriginal,
     Exploded,
 }
 
-impl WindowLayoutMetrics {
-    fn rect_for(&self, window: &WindowData) -> CGRect {
-        let wx = window.frame.origin.x - self.min_x;
-        let wy_top = window.frame.origin.y - self.min_y + window.frame.size.height;
-        let wy = self.disp_h - wy_top;
-        let ww = window.frame.size.width;
-        let wh = window.frame.size.height;
-
-        let mut rx = self.x_offset + wx * self.scale;
-        let mut ry = self.y_offset + wy * self.scale;
-        let mut rw = (ww * self.scale).max(WINDOW_TILE_MIN_SIZE);
-        let mut rh = (wh * self.scale).max(WINDOW_TILE_MIN_SIZE);
-
-        if rw > (WINDOW_TILE_MIN_SIZE + WINDOW_TILE_GAP) {
-            rx += WINDOW_TILE_GAP / 2.0;
-            rw -= WINDOW_TILE_GAP;
-        }
-        if rh > (WINDOW_TILE_MIN_SIZE + WINDOW_TILE_GAP) {
-            ry += WINDOW_TILE_GAP / 2.0;
-            rh -= WINDOW_TILE_GAP;
-        }
-
-        CGRect::new(CGPoint::new(rx, ry), CGSize::new(rw, rh))
-    }
-}
-
 struct FadeState {
     id: u64,
 }
 
-#[derive(Clone, Copy)]
-struct ScreenMetrics {
-    id: Option<ScreenId>,
-    frame: CGRect,
-    scale: f64,
-    converter: CoordinateConverter,
-}
-
 impl MissionControlOverlay {
-    fn gather_screen_metrics(&self) -> Option<(Vec<ScreenMetrics>, CoordinateConverter)> {
+    fn gather_screen_metrics(
+        &self,
+    ) -> Option<(Vec<(ScreenInfo, f64, CGRect)>, CoordinateConverter)> {
         let mut cache = ScreenCache::new(self.mtm);
-        let Some((_descriptors, converter)) = cache.update_screen_config() else {
+        let Some((screens, converter)) = cache.refresh() else {
             return None;
         };
 
-        let screens = NSScreen::screens(self.mtm);
+        let ns_screens = NSScreen::screens(self.mtm);
         let mut metrics = Vec::new();
-        for screen in screens.iter() {
-            if let Ok(screen_id) = screen.get_number() {
-                let frame = CGDisplayBounds(screen_id.as_u32());
-                metrics.push(ScreenMetrics {
-                    id: Some(screen_id),
-                    frame,
-                    scale: screen.backingScaleFactor(),
-                    converter,
-                });
+        for screen in ns_screens.iter() {
+            if let Ok(screen_id) = screen.get_number()
+                && let Some(info) = screens.iter().find(|info| info.id == screen_id)
+            {
+                // Use raw display bounds for cursor hit-testing (menu bar/dock included).
+                let raw_bounds = CGDisplayBounds(screen_id.as_u32());
+                metrics.push((info.clone(), screen.backingScaleFactor(), raw_bounds));
             }
         }
 
@@ -617,18 +567,43 @@ impl MissionControlOverlay {
         }
     }
 
-    fn screen_under_cursor_with(&self, metrics: &[ScreenMetrics]) -> Option<ScreenMetrics> {
+    fn screen_under_cursor_with(
+        &self,
+        metrics: &[(ScreenInfo, f64, CGRect)],
+    ) -> Option<(ScreenInfo, f64)> {
         if let Ok(loc) = current_cursor_location() {
-            return metrics.iter().find(|m| m.frame.contains(loc)).copied();
+            return metrics
+                .iter()
+                .find(|(_, _, frame)| frame.contains(loc))
+                .map(|(screen, scale, _)| (screen.clone(), *scale));
         }
 
         None
     }
 
-    fn main_screen_metric(&self, metrics: &[ScreenMetrics]) -> Option<ScreenMetrics> {
-        let screen = NSScreen::mainScreen(self.mtm)?;
-        let screen_id = screen.get_number().ok()?;
-        metrics.iter().find(|m| m.id == Some(screen_id)).copied()
+    fn active_space_metric_with(
+        &self,
+        metrics: &[(ScreenInfo, f64, CGRect)],
+    ) -> Option<(ScreenInfo, f64)> {
+        let active_space = get_active_space_number()?;
+        metrics
+            .iter()
+            .find(|(info, _, _)| info.space == Some(active_space))
+            .map(|(info, scale, _)| (info.clone(), *scale))
+    }
+
+    fn current_overlay_metric(
+        &self,
+        metrics: &[(ScreenInfo, f64, CGRect)],
+    ) -> Option<(ScreenInfo, f64)> {
+        let center = CGPoint::new(
+            self.frame.origin.x + self.frame.size.width / 2.0,
+            self.frame.origin.y + self.frame.size.height / 2.0,
+        );
+        metrics
+            .iter()
+            .find(|(_, _, frame)| frame.contains(center))
+            .map(|(info, scale, _)| (info.clone(), *scale))
     }
 
     fn rect_contains_point(rect: CGRect, point: CGPoint) -> bool {
@@ -690,61 +665,6 @@ impl MissionControlOverlay {
         None
     }
 
-    fn compute_window_layout(
-        windows: &[WindowData],
-        bounds: CGRect,
-    ) -> Option<WindowLayoutMetrics> {
-        if windows.is_empty() {
-            return None;
-        }
-
-        let mut min_x = f64::INFINITY;
-        let mut min_y = f64::INFINITY;
-        let mut max_x = f64::NEG_INFINITY;
-        let mut max_y = f64::NEG_INFINITY;
-
-        for w in windows {
-            let x0 = w.frame.origin.x;
-            let y0 = w.frame.origin.y;
-            let x1 = x0 + w.frame.size.width;
-            let y1 = y0 + w.frame.size.height;
-            if x0 < min_x {
-                min_x = x0;
-            }
-            if y0 < min_y {
-                min_y = y0;
-            }
-            if x1 > max_x {
-                max_x = x1;
-            }
-            if y1 > max_y {
-                max_y = y1;
-            }
-        }
-
-        let disp_w = (max_x - min_x).max(1.0);
-        let disp_h = (max_y - min_y).max(1.0);
-
-        let cx = bounds.origin.x + WINDOW_TILE_INSET;
-        let cy = bounds.origin.y + WINDOW_TILE_INSET;
-        let cw = (bounds.size.width - 2.0 * WINDOW_TILE_INSET).max(1.0);
-        let ch = (bounds.size.height - 2.0 * WINDOW_TILE_INSET).max(1.0);
-
-        let scale =
-            (cw / disp_w).min(ch / disp_h).min(WINDOW_TILE_MAX_SCALE) * WINDOW_TILE_SCALE_FACTOR;
-        let x_offset = cx + (cw - disp_w * scale) / 2.0;
-        let y_offset = cy + (ch - disp_h * scale) / 2.0;
-
-        Some(WindowLayoutMetrics {
-            scale,
-            x_offset,
-            y_offset,
-            min_x,
-            min_y,
-            disp_h,
-        })
-    }
-
     fn compute_exploded_layout(windows: &[WindowData], bounds: CGRect) -> Option<Vec<CGRect>> {
         if windows.is_empty() {
             return None;
@@ -798,13 +718,18 @@ impl MissionControlOverlay {
         let mut ordered: Vec<(usize, &WindowData)> = windows.iter().enumerate().collect();
         ordered.sort_by(|(ai, a), (bi, b)| {
             use std::cmp::Ordering;
-            let top_a = a.frame.origin.y + a.frame.size.height;
-            let top_b = b.frame.origin.y + b.frame.size.height;
+            let top_a = a.info.frame.origin.y + a.info.frame.size.height;
+            let top_b = b.info.frame.origin.y + b.info.frame.size.height;
             top_b
                 .partial_cmp(&top_a)
                 .unwrap_or(Ordering::Equal)
                 .then_with(|| {
-                    a.frame.origin.x.partial_cmp(&b.frame.origin.x).unwrap_or(Ordering::Equal)
+                    a.info
+                        .frame
+                        .origin
+                        .x
+                        .partial_cmp(&b.info.frame.origin.x)
+                        .unwrap_or(Ordering::Equal)
                 })
                 .then_with(|| ai.cmp(bi))
         });
@@ -830,8 +755,8 @@ impl MissionControlOverlay {
                 bounds.origin.x + spacing + row_offset + (cell_w + spacing) * (col_in_row as f64);
             let cell_origin_y = bounds.origin.y + spacing + (cell_h + spacing) * (row as f64);
 
-            let original_w = window.frame.size.width.max(1.0);
-            let original_h = window.frame.size.height.max(1.0);
+            let original_w = window.info.frame.size.width.max(1.0);
+            let original_h = window.info.frame.size.height.max(1.0);
             let mut scale =
                 (relaxed_w / original_w).min(relaxed_h / original_h).min(WINDOW_TILE_MAX_SCALE);
             if scale > 0.5 {
@@ -861,8 +786,19 @@ impl MissionControlOverlay {
     ) -> Option<Vec<CGRect>> {
         match kind {
             WindowLayoutKind::PreserveOriginal => {
-                let layout = Self::compute_window_layout(windows, bounds)?;
-                Some(windows.iter().map(|w| layout.rect_for(w)).collect())
+                let layout = compute_window_layout_metrics(
+                    windows,
+                    bounds,
+                    WINDOW_TILE_INSET,
+                    WINDOW_TILE_SCALE_FACTOR,
+                    Some(WINDOW_TILE_MAX_SCALE),
+                )?;
+                Some(
+                    windows
+                        .iter()
+                        .map(|w| layout.rect_for(w, WINDOW_TILE_MIN_SIZE, WINDOW_TILE_GAP))
+                        .collect(),
+                )
             }
             WindowLayoutKind::Exploded => Self::compute_exploded_layout(windows, bounds),
         }
@@ -1161,7 +1097,7 @@ impl MissionControlOverlay {
                     } else {
                         let idx = idx.min(windows.len().saturating_sub(1));
                         windows.get(idx).map(|window| {
-                            let window_server_id = window.window_server_id.map(WindowServerId::new);
+                            let window_server_id = window.info.sys_id;
                             MissionControlAction::FocusWindow {
                                 window_id: window.id,
                                 window_server_id,
@@ -1202,93 +1138,92 @@ impl MissionControlOverlay {
         let parent_layer = parent_layer;
         let mut visible_ids: HashSet<String> = HashSet::default();
         visible_ids.reserve(visible.len());
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        for (order_idx, (original_idx, _)) in visible.iter().enumerate() {
-            autoreleasepool(|_| {
-                let ws = &workspaces[*original_idx];
-                let rect = grid.rect_for(order_idx);
-                visible_ids.insert(ws.id.clone());
-                let (ws_layer, label_layer) = {
-                    let mut st = state.borrow_mut();
-                    let ws_layer = st
-                        .workspace_layers
-                        .entry(ws.id.clone())
-                        .or_insert_with(|| {
-                            let lay = CALayer::layer();
-                            parent_layer.addSublayer(&lay);
-                            lay.setContentsScale(self.scale);
-                            lay
-                        })
-                        .clone();
-                    let label_layer = st
-                        .workspace_label_layers
-                        .entry(ws.id.clone())
-                        .or_insert_with(|| {
-                            let tl = CATextLayer::layer();
-                            parent_layer.addSublayer(&tl);
-                            tl.setContentsScale(self.scale);
-                            tl
-                        })
-                        .clone();
-                    match st.workspace_label_strings.entry(ws.id.clone()) {
-                        hash_map::Entry::Occupied(mut occ) => {
-                            if occ.get_mut().update(&ws.name) {
-                                unsafe {
-                                    occ.get().apply_to(&label_layer);
+        with_disabled_actions(|| {
+            for (order_idx, (original_idx, _)) in visible.iter().enumerate() {
+                autoreleasepool(|_| {
+                    let ws = &workspaces[*original_idx];
+                    let rect = grid.rect_for(order_idx);
+                    visible_ids.insert(ws.id.clone());
+                    let (ws_layer, label_layer) = {
+                        let mut st = state.borrow_mut();
+                        let ws_layer = st
+                            .workspace_layers
+                            .entry(ws.id.clone())
+                            .or_insert_with(|| {
+                                let lay = CALayer::layer();
+                                parent_layer.addSublayer(&lay);
+                                lay.setContentsScale(self.scale);
+                                lay
+                            })
+                            .clone();
+                        let label_layer = st
+                            .workspace_label_layers
+                            .entry(ws.id.clone())
+                            .or_insert_with(|| {
+                                let tl = CATextLayer::layer();
+                                parent_layer.addSublayer(&tl);
+                                tl.setContentsScale(self.scale);
+                                tl
+                            })
+                            .clone();
+                        match st.workspace_label_strings.entry(ws.id.clone()) {
+                            hash_map::Entry::Occupied(mut occ) => {
+                                if occ.get_mut().update(&ws.name) {
+                                    unsafe {
+                                        occ.get().apply_to(&label_layer);
+                                    }
                                 }
                             }
-                        }
-                        hash_map::Entry::Vacant(vac) => {
-                            let cache = WorkspaceLabelText::new(&ws.name);
-                            unsafe {
-                                cache.apply_to(&label_layer);
+                            hash_map::Entry::Vacant(vac) => {
+                                let cache = WorkspaceLabelText::new(&ws.name);
+                                unsafe {
+                                    cache.apply_to(&label_layer);
+                                }
+                                vac.insert(cache);
                             }
-                            vac.insert(cache);
                         }
+                        (ws_layer, label_layer)
+                    };
+                    ws_layer.setFrame(rect);
+                    ws_layer.setCornerRadius(6.0);
+                    ws_layer.setBackgroundColor(Some(&**WORKSPACE_BACKGROUND_COLOR));
+
+                    let is_selected = Some(order_idx) == selected;
+                    if is_selected {
+                        ws_layer.setBorderColor(Some(&**SELECTED_BORDER_COLOR));
+
+                        ws_layer.setBorderWidth(3.0);
+                    } else {
+                        ws_layer.setBorderColor(Some(&**WORKSPACE_BORDER_COLOR));
+
+                        ws_layer.setBorderWidth(1.0);
                     }
-                    (ws_layer, label_layer)
-                };
-                ws_layer.setFrame(rect);
-                ws_layer.setCornerRadius(6.0);
-                ws_layer.setBackgroundColor(Some(&**WORKSPACE_BACKGROUND_COLOR));
+                    ws_layer.setZPosition(-1.0);
+                    self.draw_windows_tile(
+                        state,
+                        parent_layer,
+                        &ws.windows,
+                        rect,
+                        None,
+                        WindowLayoutKind::PreserveOriginal,
+                    );
+                    let label_height = 18.0;
+                    let label_frame = CGRect::new(
+                        CGPoint::new(rect.origin.x + 6.0, rect.origin.y + 6.0),
+                        CGSize::new((rect.size.width - 12.0).max(10.0), label_height),
+                    );
+                    label_layer.setFrame(label_frame);
+                    label_layer.setContentsScale(self.scale);
+                    label_layer.setMasksToBounds(false);
 
-                let is_selected = Some(order_idx) == selected;
-                if is_selected {
-                    ws_layer.setBorderColor(Some(&**SELECTED_BORDER_COLOR));
+                    label_layer.setFontSize(12.0);
+                    let fg = NSColor::labelColor();
+                    label_layer.setForegroundColor(Some(&fg.CGColor()));
 
-                    ws_layer.setBorderWidth(3.0);
-                } else {
-                    ws_layer.setBorderColor(Some(&**WORKSPACE_BORDER_COLOR));
-
-                    ws_layer.setBorderWidth(1.0);
-                }
-                ws_layer.setZPosition(-1.0);
-                self.draw_windows_tile(
-                    state,
-                    parent_layer,
-                    &ws.windows,
-                    rect,
-                    None,
-                    WindowLayoutKind::PreserveOriginal,
-                );
-                let label_height = 18.0;
-                let label_frame = CGRect::new(
-                    CGPoint::new(rect.origin.x + 6.0, rect.origin.y + 6.0),
-                    CGSize::new((rect.size.width - 12.0).max(10.0), label_height),
-                );
-                label_layer.setFrame(label_frame);
-                label_layer.setContentsScale(self.scale);
-                label_layer.setMasksToBounds(false);
-
-                label_layer.setFontSize(12.0);
-                let fg = NSColor::labelColor();
-                label_layer.setForegroundColor(Some(&fg.CGColor()));
-
-                label_layer.setZPosition(2.0);
-            });
-        }
-        CATransaction::commit();
+                    label_layer.setZPosition(2.0);
+                });
+            }
+        });
         {
             let mut st = state.borrow_mut();
             let visible_ids = &visible_ids;
@@ -1329,87 +1264,84 @@ impl MissionControlOverlay {
 
         let parent_layer = parent_layer;
 
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
+        with_disabled_actions(|| {
+            for idx in (0..windows.len()).rev() {
+                autoreleasepool(|_| {
+                    let window = &windows[idx];
+                    let rect = rects[idx];
+                    let is_selected = selected_idx.map_or(false, |s| s == idx);
+                    Self::draw_window_outline(rect, is_selected);
 
-        for idx in (0..windows.len()).rev() {
-            autoreleasepool(|_| {
-                let window = &windows[idx];
-                let rect = rects[idx];
-                let is_selected = selected_idx.map_or(false, |s| s == idx);
-                Self::draw_window_outline(rect, is_selected);
-
-                let (layer, style_changed, had_image) = {
-                    let mut s = state.borrow_mut();
-                    let layer = s
-                        .preview_layers
-                        .entry(window.id)
-                        .or_insert_with(|| {
-                            let lay = CALayer::layer();
-                            parent_layer.addSublayer(&lay);
-                            lay.setContentsScale(self.scale);
-                            lay
-                        })
-                        .clone();
-                    let style_changed = s
-                        .preview_layer_styles
-                        .entry(window.id)
-                        .or_insert_with(Default::default)
-                        .update_selected(is_selected);
-                    let maybe_img_ptr = {
-                        let cache = s.preview_cache.read();
-                        cache
-                            .get(&window.id)
-                            .map(|img| img.as_ptr() as *mut objc2::runtime::AnyObject)
-                    };
-                    let mut had_image = false;
-                    if let Some(img_ptr) = maybe_img_ptr {
-                        unsafe {
-                            let _: () = msg_send![&**layer, setContents: img_ptr];
+                    let (layer, style_changed, had_image) = {
+                        let mut s = state.borrow_mut();
+                        let layer = s
+                            .preview_layers
+                            .entry(window.id)
+                            .or_insert_with(|| {
+                                let lay = CALayer::layer();
+                                parent_layer.addSublayer(&lay);
+                                lay.setContentsScale(self.scale);
+                                lay
+                            })
+                            .clone();
+                        let style_changed = s
+                            .preview_layer_styles
+                            .entry(window.id)
+                            .or_insert_with(Default::default)
+                            .update_selected(is_selected);
+                        let maybe_img_ptr = {
+                            let cache = s.preview_cache.read();
+                            cache
+                                .get(&window.id)
+                                .map(|img| img.as_ptr() as *mut objc2::runtime::AnyObject)
+                        };
+                        let mut had_image = false;
+                        if let Some(img_ptr) = maybe_img_ptr {
+                            unsafe {
+                                let _: () = msg_send![&**layer, setContents: img_ptr];
+                            }
+                            s.ready_previews.insert(window.id);
+                            had_image = true;
+                        } else if s.ready_previews.contains(&window.id) {
+                            had_image = true;
                         }
-                        s.ready_previews.insert(window.id);
-                        had_image = true;
-                    } else if s.ready_previews.contains(&window.id) {
-                        had_image = true;
-                    }
-                    (layer, style_changed, had_image)
-                };
-
-                layer.setFrame(rect);
-                layer.setMasksToBounds(true);
-                layer.setCornerRadius(4.0);
-                layer.setContentsScale(self.scale);
-                if style_changed {
-                    if is_selected {
-                        layer.setBorderColor(Some(&**SELECTED_BORDER_COLOR));
-                        layer.setBorderWidth(3.0);
-                        layer.setZPosition(1.0);
-                    } else {
-                        layer.setBorderColor(Some(&**WINDOW_BORDER_COLOR));
-
-                        layer.setBorderWidth(0.4);
-                        layer.setZPosition(0.0);
-                    }
-                }
-
-                if !had_image {
-                    let (tw, th) = if matches!(layout, WindowLayoutKind::Exploded) {
-                        (
-                            window.frame.size.width.max(1.0) as usize,
-                            window.frame.size.height.max(1.0) as usize,
-                        )
-                    } else {
-                        (
-                            (rect.size.width * 1.5).max(2.0) as usize,
-                            (rect.size.height * 1.5).max(2.0) as usize,
-                        )
+                        (layer, style_changed, had_image)
                     };
-                    self.schedule_capture(state, window, tw, th);
-                }
-            });
-        }
 
-        CATransaction::commit();
+                    layer.setFrame(rect);
+                    layer.setMasksToBounds(true);
+                    layer.setCornerRadius(4.0);
+                    layer.setContentsScale(self.scale);
+                    if style_changed {
+                        if is_selected {
+                            layer.setBorderColor(Some(&**SELECTED_BORDER_COLOR));
+                            layer.setBorderWidth(3.0);
+                            layer.setZPosition(1.0);
+                        } else {
+                            layer.setBorderColor(Some(&**WINDOW_BORDER_COLOR));
+
+                            layer.setBorderWidth(0.4);
+                            layer.setZPosition(0.0);
+                        }
+                    }
+
+                    if !had_image {
+                        let (tw, th) = if matches!(layout, WindowLayoutKind::Exploded) {
+                            (
+                                window.info.frame.size.width.max(1.0) as usize,
+                                window.info.frame.size.height.max(1.0) as usize,
+                            )
+                        } else {
+                            (
+                                (rect.size.width * 1.5).max(2.0) as usize,
+                                (rect.size.height * 1.5).max(2.0) as usize,
+                            )
+                        };
+                        self.schedule_capture(state, window, tw, th);
+                    }
+                });
+            }
+        });
     }
 
     fn draw_window_outline(_rect: CGRect, _is_selected: bool) {}
@@ -1421,7 +1353,7 @@ impl MissionControlOverlay {
         target_w: usize,
         target_h: usize,
     ) {
-        let Some(wsid) = window.window_server_id else { return };
+        let Some(wsid) = window.info.sys_id else { return };
         let st = state.borrow();
         if st.ready_previews.contains(&window.id) {
             return;
@@ -1461,10 +1393,10 @@ impl MissionControlOverlay {
             {
                 let state_ref = state_cell.borrow();
                 let mut push_window = |window: &WindowData, priority: u8| {
-                    let Some(wsid) = window.window_server_id else { return };
+                    let Some(wsid) = window.info.sys_id else { return };
 
-                    let src_w = window.frame.size.width.max(1.0);
-                    let src_h = window.frame.size.height.max(1.0);
+                    let src_w = window.info.frame.size.width.max(1.0);
+                    let src_h = window.info.frame.size.height.max(1.0);
 
                     let area = (src_w * src_h) as i64;
                     pending.push((priority, area, CaptureTask {
@@ -1533,7 +1465,7 @@ impl MissionControlOverlay {
             }
 
             let result = crate::sys::window_server::capture_window_image(
-                WindowServerId::new(task.window_server_id),
+                task.window_server_id,
                 task.target_w,
                 task.target_h,
             );
@@ -1605,10 +1537,7 @@ impl MissionControlOverlay {
 
         let mut ready_ids: Vec<WindowId> = Vec::new();
 
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-
-        {
+        with_disabled_actions(|| {
             let cache = cache_arc.read();
             for (wid, layer) in layers.iter() {
                 if let Some(img) = cache.get(wid) {
@@ -1619,9 +1548,7 @@ impl MissionControlOverlay {
                     ready_ids.push(*wid);
                 }
             }
-        }
-
-        CATransaction::commit();
+        });
 
         if !ready_ids.is_empty() {
             if let Ok(mut st) = state_cell.try_borrow_mut() {
@@ -1632,29 +1559,7 @@ impl MissionControlOverlay {
                     if let (Some(root), Some(wid), Some(size)) =
                         (st.render_root.clone(), st.render_window_id, st.render_size)
                     {
-                        unsafe {
-                            let ctx: *mut CGContext = SLWindowContextCreate(
-                                *G_CONNECTION,
-                                wid,
-                                core::ptr::null_mut() as *mut CFType,
-                            );
-                            if !ctx.is_null() {
-                                let clear = CGRect::new(CGPoint::new(0.0, 0.0), size);
-                                CGContextClearRect(ctx, clear);
-                                CGContextSaveGState(ctx);
-                                CGContextTranslateCTM(ctx, 0.0, size.height);
-                                CGContextScaleCTM(ctx, 1.0, -1.0);
-                                root.renderInContext(&*ctx);
-                                CGContextRestoreGState(ctx);
-                                CGContextFlush(ctx);
-                                SLSFlushWindowContentRegion(
-                                    *G_CONNECTION,
-                                    wid,
-                                    std::ptr::null_mut(),
-                                );
-                                CFRelease(ctx as *mut CFType);
-                            }
-                        }
+                        render_layer_to_cgs_window(wid, size, &root);
                     }
                 }
             }
@@ -1723,14 +1628,28 @@ impl MissionControlOverlay {
         let mut scale = scale;
         let mut coordinate_converter = CoordinateConverter::default();
 
-        if let Some(screen) = NSScreen::mainScreen(mtm) {
-            let mut cache = ScreenCache::new(mtm);
-            if let Some((_descriptors, converter)) = cache.update_screen_config() {
-                coordinate_converter = converter;
-            }
-            scale = screen.backingScaleFactor();
-            if let Ok(screen_id) = screen.get_number() {
-                frame = CGDisplayBounds(screen_id.as_u32());
+        let mut cache = ScreenCache::new(mtm);
+        if let Some((screens, converter)) = cache.refresh() {
+            coordinate_converter = converter;
+
+            let active_space = get_active_space_number();
+            if let Some(target) = screens
+                .iter()
+                .find(|screen| screen.space == active_space)
+                .or_else(|| screens.first())
+            {
+                frame = CGDisplayBounds(target.id.as_u32());
+                scale = NSScreen::screens(mtm)
+                    .iter()
+                    .find_map(|ns| {
+                        let id = ns.get_number().ok()?;
+                        if id == target.id {
+                            Some(ns.backingScaleFactor())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(scale);
             }
         }
 
@@ -1785,23 +1704,39 @@ impl MissionControlOverlay {
 
     pub fn set_fade_duration_ms(&mut self, ms: f64) { self.fade_duration_ms = ms.max(0.0); }
 
-    fn current_screen_metrics(&self) -> ScreenMetrics {
-        if let Some((metrics, _converter)) = self.gather_screen_metrics() {
+    fn current_screen_metrics(&self) -> (ScreenInfo, f64, CoordinateConverter) {
+        if let Some((metrics, converter)) = self.gather_screen_metrics() {
             if let Some(cursor_metric) = self.screen_under_cursor_with(&metrics) {
-                return cursor_metric;
+                let (screen, scale) = cursor_metric;
+                return (screen, scale, converter);
             }
 
-            if let Some(main_metric) = self.main_screen_metric(&metrics) {
-                return main_metric;
+            if let Some(space_metric) = self.active_space_metric_with(&metrics) {
+                let (screen, scale) = space_metric;
+                return (screen, scale, converter);
+            }
+
+            if let Some(overlay_metric) = self.current_overlay_metric(&metrics) {
+                let (screen, scale) = overlay_metric;
+                return (screen, scale, converter);
+            }
+
+            if let Some((screen, scale, _)) = metrics.first() {
+                return (screen.clone(), *scale, converter);
             }
         }
 
-        ScreenMetrics {
-            id: None,
-            frame: self.frame,
-            scale: self.scale,
-            converter: self.coordinate_converter,
-        }
+        (
+            ScreenInfo {
+                id: ScreenId::new(0),
+                frame: self.frame,
+                display_uuid: String::new(),
+                name: None,
+                space: None,
+            },
+            self.scale,
+            self.coordinate_converter,
+        )
     }
 
     pub fn update(&self, mode: MissionControlMode) {
@@ -1809,9 +1744,14 @@ impl MissionControlOverlay {
         *self.pending_hide.borrow_mut() = false;
 
         {
-            let metrics = self.current_screen_metrics();
-            let new_frame = metrics.frame;
-            let new_scale = metrics.scale;
+            let (screen, scale, converter) = self.current_screen_metrics();
+            let screen_id = screen.id.as_u32();
+            let new_frame = if screen_id == 0 {
+                self.frame
+            } else {
+                CGDisplayBounds(screen_id)
+            };
+            let new_scale = scale;
 
             let frame_changed = new_frame.origin.x != self.frame.origin.x
                 || new_frame.origin.y != self.frame.origin.y
@@ -1834,7 +1774,7 @@ impl MissionControlOverlay {
             }
             unsafe {
                 let me = self as *const _ as *mut MissionControlOverlay;
-                (*me).coordinate_converter = metrics.converter;
+                (*me).coordinate_converter = converter;
             }
         }
 
@@ -2002,43 +1942,17 @@ impl MissionControlOverlay {
     }
 
     fn draw_and_present(&self) {
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
+        with_disabled_actions(|| {
+            self.root_layer.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), self.frame.size));
+            self.root_layer.setGeometryFlipped(true);
 
-        self.root_layer.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), self.frame.size));
-        self.root_layer.setGeometryFlipped(true);
+            self.draw_contents_into_layer(
+                CGRect::new(CGPoint::new(0.0, 0.0), self.frame.size),
+                &self.root_layer,
+            );
+        });
 
-        self.draw_contents_into_layer(
-            CGRect::new(CGPoint::new(0.0, 0.0), self.frame.size),
-            &self.root_layer,
-        );
-        CATransaction::commit();
-
-        let ctx: *mut CGContext = unsafe {
-            SLWindowContextCreate(
-                *G_CONNECTION,
-                self.cgs_window.id(),
-                core::ptr::null_mut() as *mut CFType,
-            )
-        };
-        if !ctx.is_null() {
-            unsafe {
-                let clear = CGRect::new(CGPoint::new(0.0, 0.0), self.frame.size);
-                CGContextClearRect(ctx, clear);
-                CGContextSaveGState(ctx);
-                CGContextTranslateCTM(ctx, 0.0, self.frame.size.height);
-                CGContextScaleCTM(ctx, 1.0, -1.0);
-                self.root_layer.renderInContext(&*ctx);
-                CGContextRestoreGState(ctx);
-                CGContextFlush(ctx);
-                SLSFlushWindowContentRegion(
-                    *G_CONNECTION,
-                    self.cgs_window.id(),
-                    std::ptr::null_mut(),
-                );
-                CFRelease(ctx as *mut CFType);
-            }
-        }
+        render_layer_to_cgs_window(self.cgs_window.id(), self.frame.size, &self.root_layer);
     }
 
     fn emit_action(&self, action: MissionControlAction) {

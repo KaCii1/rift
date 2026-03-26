@@ -1,7 +1,7 @@
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use tracing::debug;
 
-use super::{Event, Reactor, Record, Requested, ScreenSnapshot, TransactionId};
+use super::{Event, Reactor, Record, Requested, ScreenInfo, TransactionId};
 use crate::actor;
 use crate::actor::app::{AppThreadHandle, Request, WindowId};
 use crate::common::collections::BTreeMap;
@@ -19,7 +19,7 @@ impl Reactor {
         config.settings.animate = false;
         let record = Record::new_for_test(tempfile::NamedTempFile::new().unwrap());
         let (broadcast_tx, _) = actor::channel();
-        Reactor::new(config, layout, record, broadcast_tx, None)
+        Reactor::new(config, layout, record, broadcast_tx, None, false)
     }
 
     pub fn handle_events(&mut self, events: Vec<Event>) {
@@ -29,21 +29,18 @@ impl Reactor {
     }
 }
 
-pub fn make_screen_snapshots(
-    frames: Vec<CGRect>,
-    spaces: Vec<Option<SpaceId>>,
-) -> Vec<ScreenSnapshot> {
+pub fn make_screen_snapshots(frames: Vec<CGRect>, spaces: Vec<Option<SpaceId>>) -> Vec<ScreenInfo> {
     assert_eq!(frames.len(), spaces.len());
     frames
         .into_iter()
         .zip(spaces.into_iter())
         .enumerate()
-        .map(|(idx, (frame, space))| ScreenSnapshot {
+        .map(|(idx, (frame, space))| ScreenInfo {
+            id: crate::sys::screen::ScreenId::new(idx as u32),
             frame,
             space,
             display_uuid: format!("test-display-{idx}"),
             name: None,
-            screen_id: idx as u32,
         })
         .collect()
 }
@@ -51,9 +48,9 @@ pub fn make_screen_snapshots(
 pub fn screen_params_event(
     frames: Vec<CGRect>,
     spaces: Vec<Option<SpaceId>>,
-    ws_info: Vec<WindowServerInfo>,
+    _ws_info: Vec<WindowServerInfo>,
 ) -> Event {
-    Event::ScreenParametersChanged(make_screen_snapshots(frames, spaces), ws_info)
+    Event::ScreenParametersChanged(make_screen_snapshots(frames, spaces))
 }
 
 /*impl Drop for Reactor {
@@ -83,6 +80,9 @@ pub fn make_window(idx: usize) -> WindowInfo {
         is_standard: true,
         is_root: true,
         is_minimized: false,
+        is_resizable: true,
+        min_size: None,
+        max_size: None,
         title: format!("Window{idx}"),
         frame: CGRect::new(
             CGPoint::new(100.0 * f64::from(idx as u32), 100.0),
@@ -102,11 +102,11 @@ pub fn make_windows(count: usize) -> Vec<WindowInfo> { (1..=count).map(make_wind
 pub struct Apps {
     tx: actor::Sender<Request>,
     rx: actor::Receiver<Request>,
-    pub windows: BTreeMap<WindowId, WindowState>,
+    pub windows: BTreeMap<WindowId, TestWindowState>,
 }
 
 #[derive(Default, PartialEq, Debug, Clone)]
-pub struct WindowState {
+pub struct TestWindowState {
     pub last_seen_txid: TransactionId,
     pub last_sent_txid: TransactionId,
     pub animating: bool,
@@ -137,7 +137,7 @@ impl Apps {
         with_ws_info: bool,
     ) -> Vec<Event> {
         for (id, info) in (1..).map(|idx| WindowId::new(pid, idx)).zip(&windows) {
-            self.windows.insert(id, WindowState {
+            self.windows.insert(id, TestWindowState {
                 frame: info.frame,
                 ..Default::default()
             });
@@ -160,6 +160,8 @@ impl Apps {
                         id: info.sys_id.unwrap(),
                         layer: 0,
                         frame: info.frame,
+                        min_frame: CGSize::ZERO,
+                        max_frame: CGSize::ZERO,
                     })
                     .collect()
             } else {
@@ -199,8 +201,8 @@ impl Apps {
             debug!(?request);
             match request {
                 Request::Terminate => break,
-                Request::MarkWindowsNeedingInfo(_) => {}
-                Request::GetVisibleWindows { .. } => {
+                Request::WindowMaybeDestroyed(_) => {}
+                Request::GetVisibleWindows => {
                     if got_visible_windows {
                         continue;
                     }

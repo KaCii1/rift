@@ -1,9 +1,7 @@
-use tracing::{trace, warn};
+use tracing::trace;
 
 use crate::actor::reactor::{DragState, Reactor};
-use crate::common::collections::HashMap;
 use crate::layout_engine::LayoutCommand;
-use crate::sys::screen::{SpaceId, order_visible_spaces_by_position};
 
 pub struct DragEventHandler;
 
@@ -27,32 +25,14 @@ impl DragEventHandler {
                     "Skipping deferred swap; one of the windows no longer exists"
                 );
             } else {
-                let visible_spaces_input: Vec<(SpaceId, _)> = reactor
-                    .space_manager
-                    .screens
-                    .iter()
-                    .filter_map(|screen| {
-                        let space = reactor.space_manager.space_for_screen(screen)?;
-                        let center = screen.frame.mid();
-                        Some((space, center))
-                    })
-                    .collect();
-
-                let mut visible_space_centers = HashMap::default();
-                for (space, center) in &visible_spaces_input {
-                    visible_space_centers.insert(*space, *center);
-                }
-
-                let visible_spaces =
-                    order_visible_spaces_by_position(visible_spaces_input.iter().cloned());
+                let (visible_spaces, visible_space_centers) =
+                    reactor.visible_spaces_for_layout(true);
 
                 let swap_space = reactor
                     .window_manager
                     .windows
                     .get(&dragged_wid)
-                    .and_then(|w| {
-                        reactor.best_space_for_window(&w.frame_monotonic, w.window_server_id)
-                    })
+                    .and_then(|w| reactor.best_space_for_window(&w.frame_monotonic, w.info.sys_id))
                     .or_else(|| {
                         reactor
                             .drag_manager
@@ -78,24 +58,15 @@ impl DragEventHandler {
         reactor.drag_manager.reset();
         reactor.drag_manager.drag_state = DragState::Inactive;
 
-        if finalize_needs_layout
-            || reactor.is_in_drag()
-            || reactor.drag_manager.skip_layout_for_window.is_some()
-        {
+        if finalize_needs_layout || reactor.drag_manager.skip_layout_for_window.is_some() {
             need_layout_refresh = true;
         }
 
         if need_layout_refresh {
             let skip_layout_occurred = reactor.drag_manager.skip_layout_for_window.is_some();
-            let _ = reactor.update_layout(false, false).unwrap_or_else(|e| {
-                warn!("Layout update failed: {}", e);
-                false
-            });
+            let _ = reactor.update_layout_or_warn(false, false);
             if skip_layout_occurred {
-                let _ = reactor.update_layout(false, false).unwrap_or_else(|e| {
-                    warn!("Layout update failed: {}", e);
-                    false
-                });
+                let _ = reactor.update_layout_or_warn(false, false);
             }
         }
 
