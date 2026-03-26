@@ -1,6 +1,7 @@
 use std::ffi::{c_int, c_void};
 use std::ptr::NonNull;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dispatchr::queue;
 use dispatchr::time::Time;
@@ -18,18 +19,21 @@ use objc2_core_graphics::{
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
-use super::geometry::CGRectDef;
+use super::geometry::{CGRectDef, CGSizeDef};
 use crate::actor::app::WindowId;
 use crate::layout_engine::Direction;
 use crate::sys::app::pid_t;
 use crate::sys::axuielement::{AXUIElement, Error as AxError};
 use crate::sys::cg_ok;
 use crate::sys::dispatch::DispatchExt;
+use crate::sys::mach::mach_get_window_sub_level;
 use crate::sys::process::ProcessSerialNumber;
 use crate::sys::skylight::*;
-use crate::sys::timer::Timer;
 
 static G_CONNECTION: Lazy<i32> = Lazy::new(|| unsafe { SLSMainConnectionID() });
+static LAST_WINDOWSERVER_ACTIVITY_US: AtomicU64 = AtomicU64::new(0);
+
+pub const WINDOWSERVER_QUIET_US: u64 = 350_000;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct WindowServerId(pub CGWindowID);
@@ -62,6 +66,25 @@ impl TryFrom<&AXUIElement> for WindowServerId {
 
 impl From<WindowId> for WindowServerId {
     fn from(id: WindowId) -> Self { Self(id.idx.into()) }
+}
+
+#[inline]
+fn now_us() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64
+}
+
+pub fn note_windowserver_activity(wsid: u32) {
+    LAST_WINDOWSERVER_ACTIVITY_US.store(now_us(), Ordering::SeqCst);
+    // Keep this trace low-cost; it's only used to stabilize display churn.
+    tracing::trace!(wsid, "windowserver activity");
+}
+
+pub fn windowserver_quiet_for_us(quiet_us: u64) -> bool {
+    let last = LAST_WINDOWSERVER_ACTIVITY_US.load(Ordering::SeqCst);
+    if last == 0 {
+        return true;
+    }
+    now_us().saturating_sub(last) >= quiet_us
 }
 
 #[inline]
@@ -136,6 +159,28 @@ impl WindowQuery {
     #[inline]
     #[allow(dead_code)]
     pub fn attributes(&self) -> u64 { unsafe { SLSWindowIteratorGetAttributes(self.iter) } }
+
+    #[inline]
+    pub fn constraints(&self) -> (CGSize, CGSize) {
+        let mut min = CGSize::ZERO;
+        let mut max = CGSize::ZERO;
+        let mut cur = CGSize::ZERO;
+        unsafe { SLSWindowIteratorGetConstraints(self.iter, &mut min, &mut max, &mut cur) };
+
+        if min.width == 0.0 && min.height == 0.0 && max.width == 0.0 && max.height == 0.0 {
+            unsafe {
+                SLSPackagesGetWindowConstraints(
+                    *G_CONNECTION,
+                    self.window_id(),
+                    &mut min,
+                    &mut max,
+                    &mut cur,
+                )
+            };
+        }
+
+        (min, max)
+    }
 }
 
 impl Drop for WindowQuery {
@@ -155,6 +200,10 @@ pub struct WindowServerInfo {
     pub layer: i32,
     #[serde(with = "CGRectDef")]
     pub frame: CGRect,
+    #[serde(with = "CGSizeDef")]
+    pub min_frame: CGSize,
+    #[serde(with = "CGSizeDef")]
+    pub max_frame: CGSize,
 }
 
 pub fn get_visible_windows_with_layer(layer: Option<i32>) -> Vec<WindowServerInfo> {
@@ -201,11 +250,10 @@ pub fn window_is_sticky(id: WindowServerId) -> bool {
     let space_list_ref = unsafe {
         SLSCopySpacesForWindows(*G_CONNECTION, 0x7, CFRetained::as_ptr(&cf_windows).as_ptr())
     };
-    if space_list_ref.is_null() {
+    let Some(space_list_ref) = NonNull::new(space_list_ref) else {
         return false;
-    }
-    let spaces_cf: CFRetained<CFArray<CFNumber>> =
-        unsafe { CFRetained::retain(NonNull::new_unchecked(space_list_ref)) };
+    };
+    let spaces_cf: CFRetained<CFArray<CFNumber>> = unsafe { CFRetained::from_raw(space_list_ref) };
     spaces_cf.len() > 1
 }
 
@@ -281,6 +329,8 @@ fn make_info(
             pid: pid.try_into().ok()?,
             layer,
             frame: cg_frame,
+            min_frame: CGSize::ZERO,
+            max_frame: CGSize::ZERO,
         });
     }
 
@@ -295,6 +345,8 @@ pub fn get_windows(ids: &[WindowServerId]) -> Vec<WindowServerInfo> {
             pid: 1234,
             layer: 0,
             frame: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(800.0, 600.0)),
+            min_frame: CGSize::ZERO,
+            max_frame: CGSize::ZERO,
         })
         .collect()
 }
@@ -314,11 +366,14 @@ pub fn get_windows(ids: &[WindowServerId]) -> Vec<WindowServerInfo> {
 
     let mut out = Vec::with_capacity(ids.len());
     while query.advance().is_some() {
+        let (min_frame, max_frame) = query.constraints();
         out.push(WindowServerInfo {
             id: WindowServerId::new(query.window_id()),
             pid: query.pid() as i32,
             layer: query.level(),
             frame: query.bounds(),
+            min_frame,
+            max_frame,
         });
     }
     out
@@ -388,6 +443,8 @@ pub fn window_level(wid: u32) -> Option<NSWindowLevel> {
     )?;
     Some(query.advance()?.level() as NSWindowLevel)
 }
+
+pub fn window_sub_level(wid: u32) -> c_int { unsafe { mach_get_window_sub_level(wid) } }
 
 fn iterator_window_suitable(iterator: *mut CFType) -> bool {
     let tags = unsafe { SLSWindowIteratorGetTags(iterator) };
@@ -609,7 +666,7 @@ pub fn space_is_fullscreen(sid: u64) -> bool { unsafe { SLSSpaceGetType(*G_CONNE
 pub fn space_is_system(sid: u64) -> bool { unsafe { SLSSpaceGetType(*G_CONNECTION, sid) == 2 } }
 pub fn wait_for_native_fullscreen_transition() {
     while !space_is_user(unsafe { CGSGetActiveSpace(*G_CONNECTION) }) {
-        Timer::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 

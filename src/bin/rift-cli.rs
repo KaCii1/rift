@@ -2,7 +2,9 @@ use std::io::{self, Write};
 use std::process::{self};
 
 use clap::{Parser, Subcommand};
+use rift_wm::actor::app::WindowId;
 use rift_wm::actor::reactor::{self, DisplaySelector};
+use rift_wm::common::config::LayoutMode;
 use rift_wm::ipc::{RiftCommand, RiftMachClient, RiftRequest, RiftResponse};
 use rift_wm::layout_engine as layout;
 use rift_wm::sys::window_server::WindowServerId;
@@ -74,6 +76,13 @@ enum QueryCommands {
     Applications,
     /// Get layout state for a space
     Layout { space_id: u64 },
+    /// Get workspace layout-engine mode(s)
+    WorkspaceLayout {
+        #[arg(long)]
+        space_id: Option<u64>,
+        #[arg(long)]
+        workspace_id: Option<usize>,
+    },
     /// Get performance metrics
     Metrics,
 }
@@ -112,6 +121,12 @@ enum ExecuteCommands {
     },
     /// Save current state and exit rift
     SaveAndExit,
+    /// Print layout tree debugging output in the running rift instance
+    Debug,
+    /// Serialize and print runtime state
+    Serialize,
+    /// Toggle whether the current space is managed by rift
+    ToggleSpaceActivated,
     /// Show timing metrics
     ShowTiming,
 }
@@ -168,6 +183,14 @@ enum WorkspaceCommands {
     Create,
     /// Switch to the last workspace
     Last,
+    /// Set layout mode for a workspace (or active workspace when omitted)
+    SetLayout {
+        /// Workspace index (0-based). Defaults to active workspace if omitted.
+        #[arg(long)]
+        workspace_id: Option<usize>,
+        /// Layout mode: traditional, bsp, stack, master_stack, scrolling
+        mode: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -188,6 +211,23 @@ enum LayoutCommands {
     Unjoin,
     /// Toggle floating on the focused selection (tree focus)
     ToggleFocusFloat,
+    /// Adjust master ratio by a delta (master/stack layout only)
+    AdjustMasterRatio { delta: f64 },
+    /// Adjust master count by a delta (master/stack layout only)
+    AdjustMasterCount { delta: i32 },
+    /// Promote the selected window into the master area (master/stack layout only)
+    PromoteToMaster,
+    /// Swap the first master with the first stack window (master/stack layout only)
+    SwapMasterStack,
+    /// Swap two windows by window id (`WindowId { pid: ..., idx: ... }`)
+    SwapWindows { a: String, b: String },
+    /// Scroll the strip by a normalized delta (scrolling layout only)
+    ScrollStrip { delta: f64 },
+    /// Snap the strip to the nearest column boundary (scrolling layout only)
+    SnapStrip,
+    /// Toggle centering of the selected column in scrolling layout.
+    /// If invoked again on the same selection, centering is removed.
+    CenterSelection,
 }
 
 #[derive(Subcommand)]
@@ -317,12 +357,12 @@ enum DisplayCommands {
 enum SubscribeCommands {
     /// Subscribe to Mach IPC events
     Mach {
-        /// Event to subscribe to (workspace_changed, windows_changed, window_title_changed, *)
+        /// Event to subscribe to (workspace_changed, windows_changed, window_title_changed, stacks_changed, *)
         event: String,
     },
     /// Subscribe to events via CLI command execution
     Cli {
-        /// Event to subscribe to (workspace_changed, windows_changed, window_title_changed, *)
+        /// Event to subscribe to (workspace_changed, windows_changed, window_title_changed, stacks_changed, *)
         #[arg(long)]
         event: String,
         /// Command to execute when event occurs
@@ -350,19 +390,30 @@ fn main() {
     sigpipe::reset();
     let cli = Cli::parse();
 
-    if let Commands::Service { .. } = &cli.command {
-        println!(
-            "service commands have been moved to the `rift` binary. (ie `rift service install`)"
-        );
-        process::exit(0);
-    }
-
-    let request = match build_request(cli.command) {
-        Ok(req) => req,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            process::exit(1);
+    let request = match cli.command {
+        Commands::Service { .. } => {
+            println!(
+                "service commands have been moved to the `rift` binary. (ie `rift service install`)"
+            );
+            process::exit(0);
         }
+        Commands::Subscribe {
+            subscribe: SubscribeCommands::Mach { event },
+        } => {
+            if let Err(e) = run_mach_subscription(event) {
+                eprintln!("Communication error: {}", e);
+                eprintln!("Hint: ensure the rift service is running (try `rift service start`).");
+                process::exit(1);
+            }
+            process::exit(0);
+        }
+        command => match build_request(command) {
+            Ok(req) => req,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                process::exit(1);
+            }
+        },
     };
 
     let client = match RiftMachClient::connect() {
@@ -425,6 +476,9 @@ fn build_query_request(query: QueryCommands) -> Result<RiftRequest, String> {
         QueryCommands::Window { window_id } => Ok(RiftRequest::GetWindowInfo { window_id }),
         QueryCommands::Applications => Ok(RiftRequest::GetApplications),
         QueryCommands::Layout { space_id } => Ok(RiftRequest::GetLayoutState { space_id }),
+        QueryCommands::WorkspaceLayout { space_id, workspace_id } => {
+            Ok(RiftRequest::GetWorkspaceLayouts { space_id, workspace_id })
+        }
         QueryCommands::Metrics => Ok(RiftRequest::GetMetrics),
     }
 }
@@ -454,6 +508,15 @@ fn build_execute_request(execute: ExecuteCommands) -> Result<RiftRequest, String
         ExecuteCommands::SaveAndExit => {
             RiftCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::SaveAndExit))
         }
+        ExecuteCommands::Debug => {
+            RiftCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::Debug))
+        }
+        ExecuteCommands::Serialize => {
+            RiftCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::Serialize))
+        }
+        ExecuteCommands::ToggleSpaceActivated => RiftCommand::Reactor(reactor::Command::Reactor(
+            reactor::ReactorCommand::ToggleSpaceActivated,
+        )),
         ExecuteCommands::ShowTiming => RiftCommand::Reactor(reactor::Command::Metrics(
             rift_wm::common::log::MetricsCommand::ShowTiming,
         )),
@@ -537,6 +600,29 @@ fn parse_window_server_id(input: &str) -> Result<WindowServerId, String> {
     Ok(WindowServerId::new(value))
 }
 
+fn parse_window_id(input: &str) -> Result<WindowId, String> {
+    WindowId::from_debug_string(input.trim()).ok_or_else(|| {
+        format!(
+            "Invalid window id '{}'; expected `WindowId {{ pid: 123, idx: 456 }}`",
+            input
+        )
+    })
+}
+
+fn parse_layout_mode(value: &str) -> Result<LayoutMode, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "traditional" => Ok(LayoutMode::Traditional),
+        "bsp" => Ok(LayoutMode::Bsp),
+        "stack" => Ok(LayoutMode::Stack),
+        "master_stack" => Ok(LayoutMode::MasterStack),
+        "scrolling" => Ok(LayoutMode::Scrolling),
+        other => Err(format!(
+            "Invalid layout mode '{}'; must be traditional, bsp, stack, master_stack, or scrolling",
+            other
+        )),
+    }
+}
+
 fn map_workspace_command(cmd: WorkspaceCommands) -> Result<RiftCommand, String> {
     use layout::LayoutCommand as LC;
     match cmd {
@@ -561,6 +647,12 @@ fn map_workspace_command(cmd: WorkspaceCommands) -> Result<RiftCommand, String> 
         WorkspaceCommands::Last => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::SwitchToLastWorkspace,
         ))),
+        WorkspaceCommands::SetLayout { workspace_id, mode } => {
+            let mode = parse_layout_mode(&mode)?;
+            Ok(RiftCommand::Reactor(reactor::Command::Layout(
+                LC::SetWorkspaceLayout { workspace: workspace_id, mode },
+            )))
+        }
     }
 }
 
@@ -586,6 +678,32 @@ fn map_layout_command(cmd: LayoutCommands) -> Result<RiftCommand, String> {
         }
         LayoutCommands::ToggleFocusFloat => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::ToggleFocusFloating,
+        ))),
+        LayoutCommands::AdjustMasterRatio { delta } => Ok(RiftCommand::Reactor(
+            reactor::Command::Layout(LC::AdjustMasterRatio { delta }),
+        )),
+        LayoutCommands::AdjustMasterCount { delta } => Ok(RiftCommand::Reactor(
+            reactor::Command::Layout(LC::AdjustMasterCount { delta }),
+        )),
+        LayoutCommands::PromoteToMaster => Ok(RiftCommand::Reactor(reactor::Command::Layout(
+            LC::PromoteToMaster,
+        ))),
+        LayoutCommands::SwapMasterStack => Ok(RiftCommand::Reactor(reactor::Command::Layout(
+            LC::SwapMasterStack,
+        ))),
+        LayoutCommands::SwapWindows { a, b } => Ok(RiftCommand::Reactor(reactor::Command::Layout(
+            LC::SwapWindows(parse_window_id(&a)?, parse_window_id(&b)?),
+        ))),
+        LayoutCommands::ScrollStrip { delta } => {
+            Ok(RiftCommand::Reactor(reactor::Command::Layout(LC::ScrollStrip {
+                delta,
+            })))
+        }
+        LayoutCommands::SnapStrip => {
+            Ok(RiftCommand::Reactor(reactor::Command::Layout(LC::SnapStrip)))
+        }
+        LayoutCommands::CenterSelection => Ok(RiftCommand::Reactor(reactor::Command::Layout(
+            LC::CenterSelection,
         ))),
     }
 }
@@ -770,4 +888,21 @@ fn write_json(value: &Value, pretty: bool) -> Result<(), String> {
     }
     writer.write_all(b"\n").map_err(|e| e.to_string())?;
     writer.flush().map_err(|e| e.to_string())
+}
+
+fn run_mach_subscription(event: String) -> Result<(), String> {
+    let pretty = std::env::var("RIFT_CLI_PRETTY").map(|v| v != "0").unwrap_or(false);
+    let client = RiftMachClient::connect()?;
+    let subscription = client.subscribe(event)?;
+
+    loop {
+        let event_payload = subscription.recv_event()?;
+        // Exit cleanly when output is closed by the consumer.
+        if let Err(e) = write_json(&event_payload, pretty) {
+            if e.contains("Broken pipe") {
+                return Ok(());
+            }
+            return Err(format!("Failed to write event output: {e}"));
+        }
+    }
 }

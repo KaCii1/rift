@@ -8,28 +8,49 @@ use crate::actor::wm_controller::Sender as WmSender;
 pub struct SystemEventHandler;
 
 impl SystemEventHandler {
-    pub fn handle_menu_opened(reactor: &mut Reactor) {
-        debug!("menu opened");
+    pub fn handle_menu_opened(reactor: &mut Reactor, pid: i32) {
         reactor.menu_manager.menu_state = match reactor.menu_manager.menu_state {
-            MenuState::Closed => MenuState::Open(1),
-            MenuState::Open(depth) => MenuState::Open(depth.saturating_add(1)),
+            MenuState::Closed => {
+                debug!(pid, "menu opened");
+                MenuState::Open(pid)
+            }
+            MenuState::Open(owner) if owner == pid => {
+                debug!(
+                    pid,
+                    "menu already open for app; ignoring duplicate menu-open notification"
+                );
+                MenuState::Open(owner)
+            }
+            MenuState::Open(owner) => {
+                debug!(
+                    pid,
+                    owner,
+                    "menu-open owner changed without a close notification; replacing stale state"
+                );
+                MenuState::Open(pid)
+            }
         };
         reactor.update_focus_follows_mouse_state();
     }
 
-    pub fn handle_menu_closed(reactor: &mut Reactor) {
+    pub fn handle_menu_closed(reactor: &mut Reactor, pid: i32) {
         match reactor.menu_manager.menu_state {
             MenuState::Closed => {
-                debug!("menu closed with zero depth");
-            }
-            MenuState::Open(depth) => {
-                let new_depth = depth.saturating_sub(1);
-                reactor.menu_manager.menu_state = if new_depth == 0 {
-                    MenuState::Closed
-                } else {
-                    MenuState::Open(new_depth)
-                };
+                debug!(pid, "menu closed while no menu was marked open");
+                // Reassert the expected focus-follows-mouse state in case we previously
+                // got out-of-sync due to missing AX menu notifications.
                 reactor.update_focus_follows_mouse_state();
+            }
+            MenuState::Open(owner) if owner == pid => {
+                debug!(pid, "menu closed; clearing menu-open state");
+                reactor.menu_manager.menu_state = MenuState::Closed;
+                reactor.update_focus_follows_mouse_state();
+            }
+            MenuState::Open(owner) => {
+                debug!(
+                    pid,
+                    owner, "ignoring menu-closed notification for non-owning app"
+                );
             }
         }
     }
@@ -42,16 +63,21 @@ impl SystemEventHandler {
     }
 
     pub fn handle_raise_completed(reactor: &mut Reactor, window_id: WindowId, sequence_id: u64) {
-        let msg = raise_manager::Event::RaiseCompleted { window_id, sequence_id };
-        _ = reactor.communication_manager.raise_manager_tx.send(msg);
+        send_raise_event(reactor, raise_manager::Event::RaiseCompleted {
+            window_id,
+            sequence_id,
+        });
     }
 
     pub fn handle_raise_timeout(reactor: &mut Reactor, sequence_id: u64) {
-        let msg = raise_manager::Event::RaiseTimeout { sequence_id };
-        _ = reactor.communication_manager.raise_manager_tx.send(msg);
+        send_raise_event(reactor, raise_manager::Event::RaiseTimeout { sequence_id });
     }
 
     pub fn handle_register_wm_sender(reactor: &mut Reactor, sender: WmSender) {
         reactor.communication_manager.wm_sender = Some(sender);
     }
+}
+
+fn send_raise_event(reactor: &mut Reactor, event: raise_manager::Event) {
+    _ = reactor.communication_manager.raise_manager_tx.send(event);
 }

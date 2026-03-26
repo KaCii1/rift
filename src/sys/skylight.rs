@@ -10,7 +10,7 @@ use bitflags::bitflags;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use objc2_application_services::{AXError, AXUIElement};
 use objc2_core_foundation::{
-    CFArray, CFData, CFDictionary, CFNumber, CFString, CFType, CGPoint, CGRect,
+    CFArray, CFData, CFDictionary, CFNumber, CFString, CFType, CGPoint, CGRect, CGSize,
 };
 use objc2_core_graphics::{CGContext, CGError, CGImage, CGWindowID};
 use objc2_foundation::NSArray;
@@ -62,11 +62,43 @@ pub enum KnownCGSEvent {
     WindowUnhidden = 815,
     WindowHidden = 816,
     MissionControlEntered = 1204,
+    /// Named in `_WSLogStringForNotifyType`; observed when the active display /
+    /// status-bar space changes, including current-space and capability updates.
+    PackagesStatusBarSpaceChanged = 1308,
     WindowTitleChanged = 1322,
     SpaceWindowCreated = 1325,
     SpaceWindowDestroyed = 1326,
     SpaceCreated = 1327,
     SpaceDestroyed = 1328,
+    /// Posted by `managed_display_set_current_space` through
+    /// `post_space_lifecycle_notification`; likely carries the new current
+    /// space id for a display transition.
+    SpaceCurrentChanged = 1329,
+    /// Local WM notification posted during activating-click ordering; payload is
+    /// believed to be window/order metadata, but the exact layout is still
+    /// under investigation.
+    WindowManagerActivatingClickOrdering = 1333,
+    /// Local notification posted when the front connection for the current
+    /// space changes.
+    WindowManagerSpaceFrontConnectionChanged = 1334,
+    /// Local notification posted when the global front connection changes.
+    WindowManagerGlobalFrontConnectionChanged = 1335,
+    /// Posted from `finish_order_windows`; observed payload is 3 x u32.
+    WindowOrderingGroupChanged = 1336,
+    /// Posted by `-[PKGSpaceWindowManager_commitTransaction]`; useful as a
+    /// transaction boundary even when per-window membership notifications race.
+    SpaceWindowTransactionCommitted = 1338,
+    /// Posted from `finishBatchReassociateWindows`; observed payload starts with
+    /// a u64 key/space followed by a u32 count and repeated window ids.
+    SpaceWindowBatchReassociated = 1339,
+    /// Posted via `__XSetSpaceWindowManagementCapabilities`; likely tied to
+    /// space/window-management mode changes for a display or space.
+    SpaceWindowManagementCapabilitiesChanged = 1340,
+    /// Posted from `_WSWindowSetParent` and related reassociation paths.
+    WindowParentChanged = 1341,
+    /// Local notification from `managed_space_update_membership`; likely marks
+    /// a completed space-membership mutation and may carry space/window ids.
+    ManagedSpaceMembershipUpdated = 1342,
     WorkspaceWillChange = 1400,
     WorkspaceDidChange = 1401,
     WorkspaceWindowIsViewable = 1402,
@@ -204,6 +236,10 @@ unsafe extern "C" {
     pub fn CGSManagedDisplayGetCurrentSpace(cid: c_int, uuid: *mut CFString) -> u64;
     pub fn CGSCopyBestManagedDisplayForRect(cid: c_int, rect: CGRect) -> *mut CFString;
     pub fn CGDisplayCreateUUIDFromDisplayID(did: u32) -> *mut CFType;
+    pub fn CFUUIDCreateFromString(
+        allocator: *mut c_void,
+        uuid_string: *mut CFString,
+    ) -> *mut CFType;
     pub fn CFUUIDCreateString(allocator: *mut c_void, uuid: *mut CFType) -> *mut CFString;
     pub fn CGDisplayRegisterReconfigurationCallback(
         callback: Option<unsafe extern "C" fn(u32, u32, *mut c_void)>,
@@ -214,9 +250,13 @@ unsafe extern "C" {
         user_info: *mut c_void,
     );
 
+    pub safe fn CGSetLocalEventsSuppressionInterval(int: f32);
+    pub safe fn CGEnableEventStateCombining(enable: bool);
+
     pub fn SLSMainConnectionID() -> cid_t;
-    pub fn SLSDisableUpdate(cid: cid_t) -> i32;
-    pub fn SLSReenableUpdate(cid: cid_t) -> i32;
+    pub fn SLSServerPort(zero: *mut c_void) -> u32;
+    pub safe fn SLSDisableUpdate(cid: cid_t) -> i32;
+    pub safe fn SLSReenableUpdate(cid: cid_t) -> i32;
     pub fn _SLPSSetFrontProcessWithOptions(
         psn: *const ProcessSerialNumber,
         wid: u32,
@@ -264,6 +304,13 @@ unsafe extern "C" {
     pub fn SLSManagedDisplayGetCurrentSpace(cid: cid_t, uuid: *mut CFString) -> u64;
     pub fn SLSCopyActiveMenuBarDisplayIdentifier(cid: cid_t) -> *mut CFString;
     pub fn SLSSpaceGetType(cid: cid_t, sid: u64) -> c_int;
+    pub fn SLSGetMenuBarAutohideEnabled(cid: cid_t, enabled: *mut i32) -> i32;
+    pub fn SLSGetDisplayMenubarHeight(did: u32, height: *mut u32) -> i32;
+    pub fn CoreDockGetAutoHideEnabled() -> bool;
+    pub fn CoreDockGetOrientationAndPinning(orientation: *mut i32, pinning: *mut i32) -> bool;
+    pub fn SLSGetDockRectWithReason(cid: cid_t, rect: *mut CGRect, reason: *mut i32) -> bool;
+    pub fn CGDisplayIsBuiltin(did: u32) -> bool;
+    pub fn CGDisplayGetDisplayIDFromUUID(uuid: *mut CFType) -> u32;
 
     pub fn SLSWindowQueryWindows(
         cid: c_int,
@@ -283,6 +330,19 @@ unsafe extern "C" {
     pub fn SLSWindowIteratorGetAttachedWindowCount(iterator: *mut CFType) -> c_int;
     pub fn SLSWindowIteratorGetPID(iterator: *mut CFType) -> c_int;
     pub fn SLSWindowIteratorGetBounds(iterator: *mut CFType) -> CGRect;
+    pub fn SLSWindowIteratorGetConstraints(
+        iterator: *mut CFType,
+        min: *mut CGSize,
+        max: *mut CGSize,
+        cur: *mut CGSize,
+    ) -> CGError;
+    pub fn SLSPackagesGetWindowConstraints(
+        cid: cid_t,
+        wid: u32,
+        min: *mut CGSize,
+        max: *mut CGSize,
+        cur: *mut CGSize,
+    ) -> CGError;
 
     pub fn SLSCopySpacesForWindows(
         cid: cid_t,

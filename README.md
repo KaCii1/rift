@@ -24,7 +24,10 @@
 - Multiple layout styles
   - Tiling (i3/sway-like)
   - Binary Space Partitioning (bspwm-like)
-- Menubar icon that shows all of the workspaces and the layouts within <details> <summary><sup>click to see the menu bar icon</sup></summary><img src="assets/menubar.png" alt="Rift menu bar icon" /></details>
+  - Master-stack (dwm-like)
+  - Scrolling columns (niri-style)
+  - Stack (accordion)
+- Menubar icon that opens a menu for switching workspaces, changing layouts, and accessing quick Rift controls <details> <summary><sup>click to see the menu bar icon</sup></summary><img src="assets/menu_menu.png" alt="Rift menu bar icon" /></details>
 - MacOS-style mission control that allows you to visually navigate between workspaces <details><summary><sup>click to see mission control</sup></summary><img src="assets/mission_control.png" alt="Rift Mission Control view" /></details>
 - Focus follows the mouse with auto raise
 - Drag windows over one another to swap positions
@@ -50,6 +53,9 @@ Get up and running via the wiki:
 Rift is in active development but is still generally stable. There is no official release yet; expect ongoing changes.
 
 > Issues and PRs are very welcome.
+
+## Community
+Join the Rift community on Matrix for discussion, support, and announcements: [#rift:matrix.org](https://matrix.to/#/#rift:matrix.org)
 
 ## Motivation
 Aerospace worked well for me, but I missed animations and the ability to use fullscreen on one display while working on the other. I also prefer leveraging private/undocumented APIs as they tend to be more reliable (due to the OS being built on them and all the public APIs) and performant.
